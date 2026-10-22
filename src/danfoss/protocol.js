@@ -5,7 +5,7 @@
 // short or the value is not plausible: an unknown value is never a value.
 // -----------------------------------------------------------------------------
 
-import { MODES } from '../constants.js';
+import { READ_MODES } from '../constants.js';
 
 const int8 = (frame) => (frame.length >= 1 ? frame.readInt8(0) : undefined);
 const int16 = (frame) => (frame.length >= 2 ? frame.readInt16BE(0) : undefined);
@@ -34,10 +34,10 @@ export const DECODERS = {
     const value = int8(frame);
     return value !== undefined && value >= 0 && value <= 100 ? value : undefined;
   },
-  /** The manual fan step, 1-10. */
+  /** The manual fan step, 0-10 (0: a stopped unit; only 1-10 is ever offered or written). */
   step(frame) {
     const value = int8(frame);
-    return value !== undefined && value >= 1 && value <= 10 ? value : undefined;
+    return value !== undefined && value >= 0 && value <= 10 ? value : undefined;
   },
   /** A fan speed in revolutions per minute (signed short). */
   rpm(frame) {
@@ -52,10 +52,10 @@ export const DECODERS = {
   notBit(frame) {
     return frame.length >= 1 ? frame[0] === 0 : undefined;
   },
-  /** The operation mode: demand, program or manual; any other byte is unknown. */
+  /** The operation mode: demand, program, manual, or off (3, read only); any other byte is unknown. */
   mode(frame) {
     const value = int8(frame);
-    return value !== undefined ? MODES[value] : undefined;
+    return value !== undefined && value >= 0 ? READ_MODES[value] : undefined;
   },
 };
 

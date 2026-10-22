@@ -53,6 +53,16 @@ export const READ_OF = Object.fromEntries(READS.map((r) => [r.key, r]));
 /** The operation modes, by the byte of register 0x1412 (pydanfossair's OperationMode). */
 export const MODES = ['demand', 'program', 'manual'];
 
+/**
+ * The modes as read: byte 3 is a unit stopped (from the Air Dial). Not in
+ * pydanfossair; the value is the one openHAB's Danfoss Air binding names OFF
+ * (information only, nothing copied). Read only: never offered nor written.
+ */
+export const READ_MODES = [...MODES, 'off'];
+
+/** The registers of the unit's state: never skipped, a timeout only ends the read. */
+export const STATE_KEYS = new Set(['mode', 'fanStep', 'boost', 'bypass', 'autoBypass', 'away']);
+
 /** The manual fan steps (register 0x1561), as the select sends them. */
 export const FAN_STEPS = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10'];
 
@@ -146,8 +156,12 @@ export const TIMINGS = {
   connectTimeout: 3 * SECOND,
   /** One answer frame. */
   requestTimeout: 2 * SECOND,
-  /** A frame shorter than 63 bytes is complete after this silence (pydanfossair takes one recv). */
-  frameQuiet: 150,
+  /** A refused connection of a boost stop is tried again this often, until its deadline. */
+  connectRetry: 250,
+  /** A measure register skipped after repeated timeouts is tried again this often. */
+  registerRetry: HOUR,
+  /** A boost stop reaffirmed by a read leaves at least this long after the read closed the line. */
+  reassertDelay: SECOND,
   /** Failed reads: 30 s, 1, 2, then 5 minutes, never shorter than the interval. */
   backoff: [30 * SECOND, MINUTE, 2 * MINUTE, 5 * MINUTE],
   /** The time of the last read goes to /data at most once a minute. */
@@ -169,8 +183,6 @@ export const TIMINGS = {
   commandReadMax: 1_500,
   commandMinRead: 300,
   commandMinSend: 300,
-  /** A protective command still running after the ack ends by this time at most. */
-  protectTimeout: 8 * SECOND,
   /** Reads after a command, spaced: its effect, then a check. */
   followUps: [5 * SECOND, 20 * SECOND],
   /** A sent command keeps its guard until a read shows what it asked, or 90 s. */

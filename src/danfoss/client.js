@@ -2,11 +2,12 @@
 // The only network access: one TCP connection to the CCM at a time (the
 // module accepts one client), one request and one answer frame at a time.
 //
-// - An answer is one frame of 63 bytes at most, kept in a fixed buffer: a
-//   frame shorter than 63 bytes is complete after a short silence (as
-//   pydanfossair's single recv); more than 63 bytes, or bytes that arrive
-//   with no request waiting, break the session (never a frame misread as
-//   the answer of the next request).
+// - An answer is one frame of exactly 63 bytes, kept in a fixed buffer, in
+//   as many TCP segments as it comes (pydanfossair's tests: "Frames are 63
+//   bytes on the wire"). A frame still incomplete at the deadline of its
+//   request, more than 63 bytes, or bytes that arrive with no request
+//   waiting, break the session: the rest of a frame is never taken for the
+//   answer of the next request.
 // - Every wait is bounded: the connection and each answer.
 // - Errors say whether the request may have left: `sent` is set as soon as
 //   the bytes are handed to the socket, so a command that may have reached
@@ -57,11 +58,10 @@ export function tcpConnect(host, port) {
 }
 
 export class CcmSession {
-  constructor(socket, { timers = globalThis, now = Date.now, quietMs = TIMINGS.frameQuiet } = {}) {
+  constructor(socket, { timers = globalThis, now = Date.now } = {}) {
     this.socket = socket;
     this.timers = timers;
     this.now = now;
-    this.quietMs = quietMs;
     this.frame = Buffer.alloc(FRAME_SIZE);
     this.length = 0;
     this.pending = undefined;
@@ -84,22 +84,18 @@ export class CcmSession {
     }
     chunk.copy(this.frame, this.length);
     this.length += chunk.length;
-    this.timers.clearTimeout(pending.quiet);
     if (this.length === FRAME_SIZE) {
       this.settle();
-    } else {
-      pending.quiet = this.timers.setTimeout(() => this.settle(), this.quietMs);
     }
   }
 
-  /** The frame received so far answers the request. */
+  /** The 63 bytes received answer the request. */
   settle() {
     const pending = this.pending;
-    if (!pending || this.length === 0) return;
+    if (!pending || this.length !== FRAME_SIZE) return;
     this.pending = undefined;
     this.timers.clearTimeout(pending.timer);
-    this.timers.clearTimeout(pending.quiet);
-    const answer = Buffer.from(this.frame.subarray(0, this.length));
+    const answer = Buffer.from(this.frame);
     this.length = 0;
     pending.resolve(answer);
   }
@@ -112,7 +108,6 @@ export class CcmSession {
     this.pending = undefined;
     if (pending) {
       this.timers.clearTimeout(pending.timer);
-      this.timers.clearTimeout(pending.quiet);
       pending.reject(new CcmError(err.kind, err.message, { sent: true }));
     }
     try {
@@ -132,7 +127,8 @@ export class CcmSession {
   }
 
   /**
-   * Sends one request and resolves with its answer frame (1 to 63 bytes).
+   * Sends one request and resolves with its answer frame (exactly 63 bytes);
+   * an incomplete frame at `timeoutMs` ends the session (TIMEOUT, sent).
    * `beforeSend()` may throw to stop the request before any byte leaves;
    * `startBy`: the bytes leave by then or not at all.
    */
@@ -161,7 +157,7 @@ export class CcmSession {
         }
       }
       this.length = 0;
-      this.pending = { resolve, reject, timer: undefined, quiet: undefined };
+      this.pending = { resolve, reject, timer: undefined };
       this.pending.timer = this.timers.setTimeout(() => {
         this.fail(new CcmError(ERROR_KINDS.TIMEOUT, 'no answer'));
       }, timeoutMs);

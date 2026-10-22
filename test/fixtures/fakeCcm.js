@@ -56,7 +56,11 @@ class FakeSocket extends EventEmitter {
   destroy() {
     if (this.destroyed) return;
     this.destroyed = true;
-    if (this.unit.open === this) this.unit.open = undefined;
+    if (this.unit.open === this) {
+      this.unit.open = undefined;
+      // A CCM that frees its place a moment after a close.
+      this.unit.busyUntil = Date.now() + this.unit.freeDelay;
+    }
     setImmediate(() => this.emit('close'));
   }
 
@@ -80,9 +84,13 @@ export function fakeCcm({ registers = defaultRegisters() } = {}) {
     delays: {},
     /** Writes received but not applied (an unconfirmed command). */
     ignoreWrites: false,
-    /** Answers split in two chunks, or 2 bytes only (a short frame). */
+    /** Answers split in two chunks (`splitGap` ms apart), or 2 bytes only (a short frame). */
     split: false,
+    splitGap: 0,
     short: false,
+    /** Milliseconds after a close during which a new connection is refused. */
+    freeDelay: 0,
+    busyUntil: -Infinity,
     handle(socket, bytes) {
       const reg = bytes.subarray(2, 4).toString('hex');
       const write = bytes[1] === 0x06;
@@ -98,7 +106,14 @@ export function fakeCcm({ registers = defaultRegisters() } = {}) {
         Buffer.from(value).copy(frame);
         if (unit.split) {
           socket.emit('data', frame.subarray(0, 1));
-          socket.emit('data', frame.subarray(1));
+          if (unit.splitGap > 0) {
+            setTimeout(
+              () => !socket.destroyed && socket.emit('data', frame.subarray(1)),
+              unit.splitGap,
+            );
+          } else {
+            socket.emit('data', frame.subarray(1));
+          }
         } else {
           socket.emit('data', frame);
         }
@@ -109,7 +124,7 @@ export function fakeCcm({ registers = defaultRegisters() } = {}) {
       unit.connections += 1;
       setTimeout(() => {
         if (socket.destroyed) return;
-        if (unit.down || unit.open) {
+        if (unit.down || unit.open || Date.now() < unit.busyUntil) {
           unit.refused += 1;
           socket.emit('error', Object.assign(new Error('refused'), { code: 'ECONNREFUSED' }));
           return;

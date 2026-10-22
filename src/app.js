@@ -46,6 +46,7 @@ import {
   READS,
   READ_OF,
   SECOND,
+  STATE_KEYS,
   TIMINGS,
 } from './constants.js';
 import { ERROR_KINDS, CcmError, errorReason, openSession, tcpConnect } from './danfoss/client.js';
@@ -117,7 +118,10 @@ export class DanfossAirApp {
     this.stopGuard = undefined;
     /** Register key -> timeouts in a row while the unit answered the others. */
     this.timeouts = new Map();
-    this.skipped = new Set();
+    /** Measure key -> when it is tried again (skipped after repeated timeouts). */
+    this.skipped = new Map();
+    /** The pending reaffirmation of a boost stop. */
+    this.reassertTimer = undefined;
   }
 
   // --- Lifecycle -------------------------------------------------------------
@@ -129,9 +133,14 @@ export class DanfossAirApp {
    */
   async start(raw = {}, { fresh = false } = {}) {
     this.stop();
-    await this.unit.running;
-    const generation = this.generation;
+    // Set at once: a `connected` or a configuration saved during this start
+    // compares with it (never a restart, never a read before the interval).
     this.config = normalizeConfig(raw);
+    const generation = this.generation;
+    await this.unit.running;
+    if (generation !== this.generation) {
+      return;
+    }
     this.memory = normalizeMemory(await this.store.load().catch(() => null), this.now());
     if (generation !== this.generation) {
       return;
@@ -149,6 +158,9 @@ export class DanfossAirApp {
       return;
     }
     await this.setStatus(false, this.status());
+    if (generation !== this.generation) {
+      return;
+    }
     const wait = fresh ? 0 : this.firstWait();
     if (wait > 0) {
       this.schedule(wait);
@@ -179,6 +191,13 @@ export class DanfossAirApp {
     this.unit.followUps.clear();
     this.active?.abort('stopped');
     this.publisher.stop();
+    // Guards and reaffirmations belong to this address and this run only.
+    this.guards.clear();
+    this.stopGuard = undefined;
+    if (this.reassertTimer) {
+      this.timers.clearTimeout(this.reassertTimer);
+      this.reassertTimer = undefined;
+    }
   }
 
   clearTimer() {
@@ -274,8 +293,13 @@ export class DanfossAirApp {
 
   // --- The line (one connection to the CCM at a time) --------------------------
 
-  /** Runs `fn(session)` on its own connection; the line is held until it ends. */
-  async useLine(kind, timeoutMs, fn) {
+  /**
+   * Runs `fn(session)` on its own connection; the line is held until it ends.
+   * `retryUntil`: a refused connection is tried again every 250 ms until then
+   * (the CCM may free its place a moment after our own close); nothing is
+   * sent before the connection, so this never repeats a command.
+   */
+  async useLine(kind, timeoutMs, fn, { retryUntil } = {}) {
     let finish;
     const record = {
       kind,
@@ -293,15 +317,38 @@ export class DanfossAirApp {
     };
     this.active = record;
     try {
-      record.opener = openSession({
-        host: this.config.address.host,
-        port: this.config.address.port,
-        connect: this.connect,
-        timeoutMs,
-        timers: this.timers,
-        now: this.now,
-      });
-      const session = await record.opener.promise;
+      let session;
+      for (;;) {
+        const attemptMs =
+          retryUntil === undefined
+            ? timeoutMs
+            : Math.min(timeoutMs, Math.max(100, retryUntil - this.now()));
+        record.opener = openSession({
+          host: this.config.address.host,
+          port: this.config.address.port,
+          connect: this.connect,
+          timeoutMs: attemptMs,
+          timers: this.timers,
+          now: this.now,
+        });
+        try {
+          session = await record.opener.promise;
+          break;
+        } catch (err) {
+          const again =
+            err.kind === ERROR_KINDS.UNREACHABLE &&
+            !record.aborted &&
+            retryUntil !== undefined &&
+            this.now() + TIMINGS.connectRetry < retryUntil;
+          if (!again) {
+            throw err;
+          }
+        }
+        await new Promise((resolve) => this.timers.setTimeout(resolve, TIMINGS.connectRetry));
+        if (record.aborted) {
+          throw new CcmError(ERROR_KINDS.ABORTED, 'line taken');
+        }
+      }
       record.session = session;
       if (record.aborted) {
         session.abort();
@@ -347,7 +394,7 @@ export class DanfossAirApp {
     const generation = this.generation;
     u.timer = this.timers.setTimeout(() => {
       u.timer = undefined;
-      if (generation === this.generation) {
+      if (generation === this.generation && u === this.unit) {
         this.tick().catch(() => this.logger.error('Danfoss Air refresh failed'));
       }
     }, wait);
@@ -431,14 +478,17 @@ export class DanfossAirApp {
   /**
    * Every register, one after the other. A register that times out while
    * the unit answered the ones before ends the read (the late answer could be
-   * taken for the next one): what was read is kept, and after three such
-   * reads in a row that register is skipped until a restart.
+   * taken for the next one): what was read is kept. A state register (mode,
+   * step, boost, bypass, away) is never skipped; a measure that times out
+   * three reads in a row is skipped, and tried again every hour (one log
+   * line when it is skipped).
    */
   async readAll(session) {
     const values = {};
     let answered = 0;
     for (const register of READS) {
-      if (this.skipped.has(register.key)) {
+      const skippedUntil = this.skipped.get(register.key);
+      if (skippedUntil !== undefined && this.now() < skippedUntil) {
         continue;
       }
       let frame;
@@ -448,11 +498,15 @@ export class DanfossAirApp {
         if (err.kind === ERROR_KINDS.TIMEOUT && answered > 0) {
           const count = (this.timeouts.get(register.key) ?? 0) + 1;
           this.timeouts.set(register.key, count);
-          if (count >= LIMITS.registerTimeouts) {
-            this.skipped.add(register.key);
-            this.logger.warn(
-              `Danfoss Air: register ${register.key} never answers, not read until a restart`,
-            );
+          if (STATE_KEYS.has(register.key)) {
+            this.logger.warn(`Danfoss Air: register ${register.key} did not answer`);
+          } else if (count >= LIMITS.registerTimeouts) {
+            if (skippedUntil === undefined) {
+              this.logger.warn(
+                `Danfoss Air: register ${register.key} never answers, tried again every hour`,
+              );
+            }
+            this.skipped.set(register.key, this.now() + TIMINGS.registerRetry);
           } else {
             this.logger.warn(`Danfoss Air: register ${register.key} did not answer`);
           }
@@ -462,6 +516,7 @@ export class DanfossAirApp {
       }
       answered += 1;
       this.timeouts.delete(register.key);
+      this.skipped.delete(register.key);
       const value = decode(register.decode, frame);
       if (value !== undefined) {
         values[register.key] = value;
@@ -724,12 +779,12 @@ export class DanfossAirApp {
   }
 
   /** The values a command read or confirmed: in memory and to Gladys in the background. */
-  noteValues(values) {
+  noteValues(values, { fromCommand = false } = {}) {
     if (this.unit.online !== true || !this.unit.values) {
       return;
     }
     Object.assign(this.unit.values, values);
-    this.observe(values);
+    this.observe(values, { fromCommand });
     this.queueValues(values);
     // Shown in the background: the ack never waits for Gladys.
     this.flush().catch(() => {});
@@ -838,14 +893,26 @@ export class DanfossAirApp {
       }
       const value = decode(READ_OF[key].decode, frame);
       if (value === undefined) {
-        throw this.refusal(ERRORS.unknownState(word(both('unreadable', 'illisible'), 'en')));
+        if (key === 'mode') {
+          throw this.refusal(ERRORS.unknownMode(frame.length > 0 ? frame.readInt8(0) : '?'));
+        }
+        throw this.refusal(ERRORS.unknownState(word(ERRORS.unreadable, this.config.language)));
       }
       fresh[key] = value;
     }
     check();
-    this.noteValues(fresh);
+    // A fresh read of a command never reaffirms a boost stop.
+    this.noteValues(fresh, { fromCommand: true });
+    if (fresh.mode === 'off') {
+      throw this.refusal(ERRORS.unitOff);
+    }
     if (command.needsManual && fresh.mode !== 'manual') {
       throw this.refusal(ERRORS.notManual);
+    }
+    if (plan.role === FEATURES.BOOST_START) {
+      // A boost start decided is the latest wish: an older boost stop is never reaffirmed after it.
+      this.stopGuard = undefined;
+      this.lastBoostStartAt = this.now();
     }
     state.from = fresh[command.read];
     if (state.from === plan.expected && !this.guardActive(command.read)) {
@@ -906,10 +973,12 @@ export class DanfossAirApp {
   }
 
   /**
-   * Never held back: takes the line from anything, one try, without a fresh
-   * read; the register read back confirms it. Answered by 4.3 s; still
-   * running then, it goes on (bounded) and the answer is "sent, without
-   * confirmation".
+   * Never held back: takes the line from anything, one write, without a
+   * fresh read; a refused connection is tried again every 250 ms until 3.5 s
+   * after the click (nothing is sent before it); the register read back
+   * confirms it. Answered by 4.3 s; still running then, it goes on, bounded
+   * by its connection (3 s) and two answers (2 s each), and the answer says
+   * whether it was written yet.
    */
   async sendStop(plan, received) {
     // A command not written yet gives way (checked right before its write).
@@ -919,19 +988,25 @@ export class DanfossAirApp {
     const sending = (async () => {
       try {
         await this.takeLine(['read', 'command', 'protect']);
-        return await this.useLine('protect', TIMINGS.connectTimeout, async (session) => {
-          await session.request(writeFrame(plan.command.register, plan.byte), {
-            beforeSend: () => {
-              state.written = true;
-              state.sentAt = this.now();
-              this.lastSentAt = this.now();
-            },
-          });
-          return decode(
-            READ_OF[plan.command.read].decode,
-            await session.request(READ_OF[plan.command.read].frame),
-          );
-        });
+        const retryUntil = received + TIMINGS.commandSendBy;
+        return await this.useLine(
+          'protect',
+          TIMINGS.connectTimeout,
+          async (session) => {
+            await session.request(writeFrame(plan.command.register, plan.byte), {
+              beforeSend: () => {
+                state.written = true;
+                state.sentAt = this.now();
+                this.lastSentAt = this.now();
+              },
+            });
+            return decode(
+              READ_OF[plan.command.read].decode,
+              await session.request(READ_OF[plan.command.read].frame),
+            );
+          },
+          { retryUntil },
+        );
       } finally {
         this.reserved -= 1;
       }
@@ -961,6 +1036,9 @@ export class DanfossAirApp {
       sending.catch((err) =>
         this.logger.warn(`Danfoss Air: boost stop failed after the ack (${errorReason(err)})`),
       );
+      if (!state.written) {
+        throw this.refusal(ERRORS.stopPending);
+      }
       throw this.refusal(
         ERRORS.sentUnconfirmed(
           word(both('no answer yet', 'pas encore de réponse'), this.config.language),
@@ -1008,7 +1086,7 @@ export class DanfossAirApp {
    * not confirmed is sent again when the boost shows on and no boost start
    * left after it.
    */
-  observe(values) {
+  observe(values, { fromCommand = false } = {}) {
     for (const key of [...this.guards.keys()]) {
       if (!this.guardActive(key) || values[key] === undefined) {
         continue;
@@ -1033,11 +1111,28 @@ export class DanfossAirApp {
       this.stopGuard = undefined;
       return;
     }
-    if (values.boost === true && !this.protecting && stop.reasserts < TIMINGS.stopReasserts) {
+    if (
+      values.boost === true &&
+      !fromCommand &&
+      !this.protecting &&
+      !this.reassertTimer &&
+      stop.reasserts < TIMINGS.stopReasserts
+    ) {
       stop.reasserts += 1;
       this.logger.warn('Danfoss Air: the boost is still on after a stop, stop sent again');
-      // Not awaited: the read that saw it goes on.
-      this.timers.setTimeout(() => {
+      // Not awaited, and a second after the read closed the line (the CCM may
+      // free its place a moment after a close).
+      const generation = this.generation;
+      this.reassertTimer = this.timers.setTimeout(() => {
+        this.reassertTimer = undefined;
+        if (
+          generation !== this.generation ||
+          !this.config.address ||
+          !this.stopGuard ||
+          this.lastBoostStartAt > this.stopGuard.sentAt
+        ) {
+          return;
+        }
         this.protect(
           {
             role: FEATURES.BOOST_STOP,
@@ -1047,7 +1142,7 @@ export class DanfossAirApp {
           },
           this.now(),
         ).catch((err) => this.logger.warn(`Danfoss Air: stop reaffirmed: ${err.message}`));
-      }, 0);
+      }, TIMINGS.reassertDelay);
     }
   }
 

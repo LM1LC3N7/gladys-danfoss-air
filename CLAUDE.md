@@ -66,9 +66,12 @@ scripts/cover.mjs         cover.png generator
   `boost-stop`; decided on a fresh read in the same session; written within
   3.5 s; confirmed only by a read back equal to the value asked; a written
   command is never "not sent"; never retried; the ack never waits for Gladys.
-- Never read sooner than the interval (button, scan, reconnection, restart).
-- **Answers are hostile**: 63 bytes per frame at most, implausible values
-  unknown; never log the bytes received.
+- Never read sooner than the interval (button, scan, reconnection, restart);
+  only the follow-up reads after a command not confirmed (5 s, 20 s).
+- **Answers are hostile**: a frame is complete at exactly 63 bytes (never
+  on a silence); incomplete at its deadline or longer, it ends the session;
+  implausible values unknown; never log the bytes received.
+- Never write mode 3 (off) nor step 0: stopping the ventilation is out of v1.
 - Units only from the core's `DEVICE_FEATURE_UNITS_BY_CATEGORY`.
 - Files are UTF-8 without BOM (`test/encoding.test.js`); tests never touch
   the network (loopback only).

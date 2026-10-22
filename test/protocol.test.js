@@ -35,9 +35,11 @@ test('decoders: the values of pydanfossair', () => {
 });
 
 test('decoders: an implausible or short frame is unknown, never a value', () => {
-  assert.equal(decode('mode', frame(3)), undefined);
+  assert.equal(decode('mode', frame(3)), 'off', 'a unit stopped from the Air Dial (review 1, M2)');
+  assert.equal(decode('mode', frame(4)), undefined);
   assert.equal(decode('mode', frame(0xff)), undefined);
-  assert.equal(decode('step', frame(0)), undefined);
+  assert.equal(decode('step', frame(0)), 0, 'a stopped unit (review 1, M2)');
+  assert.equal(decode('step', frame(0xff)), undefined);
   assert.equal(decode('step', frame(11)), undefined);
   assert.equal(decode('percent', frame(0xff)), undefined);
   assert.equal(decode('temperature', frame(0x7f, 0xff)), undefined, '327 °C');
@@ -95,12 +97,49 @@ test('session: a frame of 63 bytes, then another request', async (t) => {
   assert.equal(b[0], 0x61);
 });
 
-test('session: a short frame is complete after a silence', async (t) => {
+test('session: a short frame is never complete: it ends the session at the deadline (review 1, B1)', async (t) => {
   const port = await server(t, (bytes, socket) => socket.write(Buffer.from([0x07, 0xd0])));
   const session = await openSession({ host: '127.0.0.1', port }).promise;
   t.after(() => session.close());
-  const answer = await session.request(Buffer.from([4, 4, 0x14, 0x73]));
-  assert.equal(decode('temperature', answer), 20);
+  await assert.rejects(
+    session.request(Buffer.from([4, 4, 0x14, 0x73]), { timeoutMs: 400 }),
+    (err) => err.kind === ERROR_KINDS.TIMEOUT && err.sent === true,
+  );
+  await assert.rejects(session.request(Buffer.from([4, 4, 0x14, 0x73])), 'session ended');
+});
+
+test('session: a frame split 300 ms apart is read whole, the next answer is its own (review 1, B1, S1a)', async (t) => {
+  let n = 0;
+  const port = await server(t, (bytes, socket) => {
+    n += 1;
+    if (n === 1) {
+      const f = frame(0x02, 0x55);
+      socket.write(f.subarray(0, 1));
+      setTimeout(() => socket.write(f.subarray(1)), 300);
+    } else {
+      setTimeout(() => socket.write(frame(0x11)), 50);
+    }
+  });
+  const session = await openSession({ host: '127.0.0.1', port }).promise;
+  t.after(() => session.close());
+  const a = await session.request(Buffer.from([1, 4, 0x14, 0x12]));
+  assert.equal(a.length, 63);
+  assert.deepEqual([a[0], a[1]], [0x02, 0x55]);
+  const b = await session.request(Buffer.from([1, 4, 0x15, 0x30]));
+  assert.equal(b[0], 0x11);
+});
+
+test('session: the rest of a frame followed by a whole frame overflows: session broken (review 1, B1)', async (t) => {
+  const port = await server(t, (bytes, socket) => {
+    socket.write(Buffer.alloc(62));
+    setTimeout(() => socket.write(frame(0x01)), 50);
+  });
+  const session = await openSession({ host: '127.0.0.1', port }).promise;
+  t.after(() => session.close());
+  await assert.rejects(
+    session.request(Buffer.from([1, 4, 0x15, 0x30])),
+    (err) => err.kind === ERROR_KINDS.PROTOCOL,
+  );
 });
 
 test('session: a frame longer than 63 bytes breaks the session', async (t) => {

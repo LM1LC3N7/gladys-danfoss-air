@@ -44,6 +44,8 @@ Un appareil, **Ventilation Danfoss Air**, avec :
 La centrale est lue toutes les 60 s (réglable de 30 s à 1 h). Le bouton de
 test, une recherche dans Découverte, une reconnexion de Gladys ou un
 redémarrage de l’intégration ne la relisent jamais avant l’intervalle.
+Seule exception : après une commande non confirmée, la centrale est relue
+5 s puis 20 s plus tard pour vérifier son effet.
 
 ## Commandes
 
@@ -61,8 +63,15 @@ ventilation.
 - Le palier ne se règle qu’en mode **manuel** (choisissez d’abord le mode).
 - **Arrêter le boost** est toujours possible : jamais bloqué par l’option,
   par une autre commande ni par une lecture en cours, il annule une commande
-  pas encore envoyée. S’il n’est pas confirmé, les lectures des deux minutes
-  suivantes le renvoient (deux fois au plus) tant que le boost reste actif.
+  pas encore envoyée. Si le CCM refuse un instant la connexion, il retente
+  toutes les 250 ms jusqu’à 3,5 s après l’appui. S’il n’est pas confirmé,
+  les lectures des deux minutes suivantes le renvoient (deux fois au plus)
+  tant que le boost reste actif ; un « Démarrer le boost » demandé ensuite
+  l’emporte et n’est jamais défait.
+- **Centrale arrêtée** depuis l’Air Dial : le statut l’indique, les listes
+  ne changent pas, et les commandes de mode et de palier sont refusées.
+  Gladys n’arrête ni ne relance la ventilation dans cette version (couper
+  une double flux arrête le renouvellement d’air).
 - Ouvrir le bypass arrête la récupération de chaleur (air neuf non
   réchauffé) : à réserver à l’été.
 
@@ -73,7 +82,10 @@ ventilation.
 - Le protocole ne donne pas de numéro de série : l’intégration affiche une
   centrale, celle de l’adresse saisie. Changer l’adresse garde l’appareil et
   son historique ; une autre centrale mise à la même adresse apparaîtrait
-  sur le même appareil.
+  sur le même appareil et recevrait aussi ses commandes. Réservez l’adresse
+  du CCM dans votre routeur (bail DHCP fixe).
+- Une réponse de la centrale doit faire exactement 63 octets ; une réponse
+  incomplète interrompt la lecture (rien n’est publié de travers).
 - Gladys occupe la connexion pendant sa lecture (environ une seconde à
   chaque intervalle) : l’application Danfoss Air peut devoir attendre, et
   inversement.

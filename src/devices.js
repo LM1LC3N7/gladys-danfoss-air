@@ -190,10 +190,11 @@ export const commandOf = (role) => (Object.hasOwn(COMMANDS, role) ? COMMANDS[rol
  */
 export function deviceStates(ids, values) {
   const states = [];
-  if (values.mode !== undefined) {
+  // The lists only show their options: a stopped unit (mode off, step 0) changes neither.
+  if (MODES.includes(values.mode)) {
     states.push({ device_feature_external_id: ids.feature(FEATURES.MODE), text: values.mode });
   }
-  if (values.fanStep !== undefined) {
+  if (FAN_STEPS.includes(String(values.fanStep))) {
     states.push({
       device_feature_external_id: ids.feature(FEATURES.FAN_STEP),
       text: String(values.fanStep),

@@ -41,7 +41,9 @@ One device, **Danfoss Air ventilation**, with:
 
 The unit is read every 60 s (configurable from 30 s to 1 h). The test
 button, a Discovery scan, a reconnection of Gladys or a restart of the
-integration never read it sooner than the interval.
+integration never read it sooner than the interval. The one exception:
+after a command that was not confirmed, the unit is read again 5 s and 20 s
+later to check its effect.
 
 ## Commands
 
@@ -58,8 +60,15 @@ off" of a voice assistant never reaches the ventilation.
 - The fan step can only be set in **manual** mode (choose the mode first).
 - **Stop the boost** is always allowed: it is never held back by the option,
   by another command or by a read in progress, and cancels a command not
-  sent yet. If it is not confirmed, the reads of the following two minutes
-  send it again (twice at most) while the boost shows on.
+  sent yet. If the CCM refuses the connection for a moment, it tries again
+  every 250 ms until 3.5 s after the press. If it is not confirmed, the
+  reads of the following two minutes send it again (twice at most) while
+  the boost shows on; a "Start the boost" pressed afterwards wins and is
+  never undone.
+- **Unit stopped** from the Air Dial: the status says so, the lists do not
+  change, and mode and fan step commands are refused. Gladys neither stops
+  nor restarts the ventilation in this version (stopping a heat recovery
+  unit stops the air renewal).
 - Opening the bypass stops the heat recovery (fresh air not warmed): use it
   in summer.
 
@@ -70,7 +79,10 @@ off" of a voice assistant never reaches the ventilation.
 - The protocol gives no serial number: the integration shows one unit, the
   one at the configured address. Changing the address keeps the device and
   its history; another unit put at the same address would show on the same
-  device.
+  device and receive its commands too. Reserve the address of the CCM in
+  your router (fixed DHCP lease).
+- An answer of the unit must be exactly 63 bytes; an incomplete answer ends
+  the read (nothing is published shifted).
 - Gladys holds the connection while it reads (about a second every
   interval): the Danfoss Air app may have to wait, and conversely.
 - The room temperature and battery come from the Air Dial remote; without

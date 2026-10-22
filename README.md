@@ -29,7 +29,14 @@ Gladys ⇄ SDK ⇄ src/handlers.js ⇄ src/app.js (DanfossAirApp)
   container restart: the time of the last read is kept in `/data`, written
   at most once a minute, before the read). Failures retried after 30 s to
   5 min, never under the interval. A register that times out while the
-  others answer ends that read, and is skipped after three times.
+  others answer ends that read; a state register (mode, step, boost,
+  bypass, away) is read again at the next poll, a measure is skipped after
+  three times and tried again every hour. Exception to the interval: the
+  reads 5 s and 20 s after a command that was not confirmed.
+- **Stopped unit**: mode 3 (stopped from the Air Dial; not in pydanfossair,
+  the value openHAB's binding names OFF) and step 0 are read and shown in
+  the status; the lists keep their options; commands that need the mode are
+  refused. Gladys never stops nor restarts the ventilation in v1.
 - **Device**: `ext:<selector>:danfoss-air:ccm` (the protocol gives no
   serial number; the address is never part of the id). Every feature is
   always published; no switch, no writable binary or fan.
@@ -43,10 +50,15 @@ Gladys ⇄ SDK ⇄ src/handlers.js ⇄ src/app.js (DanfossAirApp)
   confirmation", a guard and reads 5 s and 20 s later. One at a time, never
   retried; the ack never waits for Gladys.
 - **Stop the boost** (protective): never behind the option, takes the line
-  from anything, cancels a command not written yet, one try; not confirmed,
-  it is reaffirmed by the reads of the next 2 minutes (twice at most).
-- **Hostile answers**: a fixed 63-byte buffer per frame; more bytes, or
-  bytes without a request, end the session; implausible values are unknown.
+  from anything, cancels a command not written yet, one write; a refused
+  connection (the CCM may free its place a moment after our own close) is
+  tried again every 250 ms until 3.5 s after the click. Not confirmed, it is
+  reaffirmed by the reads of the next 2 minutes (twice at most, a second
+  after the read); a boost start decided later lifts that guard.
+- **Hostile answers**: a frame is exactly 63 bytes in a fixed buffer, in as
+  many TCP segments as it comes; a frame incomplete at its deadline, more
+  bytes, or bytes without a request end the session (never the rest of a
+  frame taken for the next answer); implausible values are unknown.
   Nothing received is logged.
 
 ## Credits

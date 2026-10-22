@@ -103,6 +103,12 @@ export const T = {
       `La centrale a mal répondu (${reason}) ; nouvel essai dans ${wait.fr}.`,
     ),
   summary: (values) => {
+    if (values.mode === 'off') {
+      return both(
+        'Danfoss Air: unit stopped (mode 3, from the Air Dial); Gladys does not restart it.',
+        'Danfoss Air : centrale arrêtée (mode 3, depuis l’Air Dial) ; Gladys ne la relance pas.',
+      );
+    }
     const mode = values.mode ? MODE_NAMES[values.mode] : both('unknown mode', 'mode inconnu');
     const step =
       values.fanStep === undefined
@@ -128,6 +134,20 @@ export const ERRORS = {
   noHost: both(
     'No address for the CCM in the configuration: not sent.',
     'Aucune adresse du CCM dans la configuration : non envoyée.',
+  ),
+  unitOff: both(
+    'The unit is stopped (mode 3, from the Air Dial): Gladys neither stops nor restarts it. Command not sent.',
+    'La centrale est arrêtée (mode 3, depuis l’Air Dial) : Gladys ne l’arrête ni ne la relance. Commande non envoyée.',
+  ),
+  unknownMode: (byte) =>
+    both(
+      `Mode ${byte} unknown, or unit stopped: command not sent.`,
+      `Mode ${byte} inconnu ou centrale arrêtée : commande non envoyée.`,
+    ),
+  unreadable: both('unreadable', 'illisible'),
+  stopPending: both(
+    'Boost stop not sent yet, still trying to reach the unit: check the boost in a few seconds.',
+    'Arrêt du boost pas encore envoyé, la centrale est encore en cours de connexion : vérifiez le boost dans quelques secondes.',
   ),
   configChanged: both(
     'The configuration changed meanwhile: not sent.',

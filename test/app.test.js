@@ -313,7 +313,7 @@ test('a register that never answers ends the read, then is skipped', async (t) =
   assert.equal(ctx.state('battery').state, 55, 'the registers after it are read again');
 });
 
-test('frames in two chunks or shorter than 63 bytes are read', async (t) => {
+test('frames in two chunks are read; a frame shorter than 63 bytes is refused (review 1, B1)', async (t) => {
   const unit = fakeCcm();
   unit.split = true;
   const ctx = await setup(t, { unit });
@@ -321,9 +321,10 @@ test('frames in two chunks or shorter than 63 bytes are read', async (t) => {
   unit.split = false;
   unit.short = true;
   unit.registers['1473'] = [0x07, 0xd0];
-  // Each short frame waits for the 150 ms of silence.
   await ctx.advance(MINUTE + 4 * SECOND, 50);
-  assert.equal(ctx.state('temperature-supply').state, 20);
+  // Never decoded: the read fails (first register incomplete), nothing new published.
+  assert.equal(ctx.state('temperature-supply').state, 18.5);
+  assert.equal(ctx.gladys.fake.connectionStatus.connected, false);
 });
 
 test('a stop of the integration during a read publishes nothing late', async (t) => {
