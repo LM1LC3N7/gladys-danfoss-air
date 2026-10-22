@@ -1,67 +1,86 @@
-# Template de démonstration
+# Danfoss Air pour Gladys
 
-Ceci est la documentation utilisateur de l'intégration. Gladys ré-héberge ce
-fichier et affiche un lien **Documentation** permanent vers lui dans l'écran
-de configuration (dans la langue de l'utilisateur, avec l'anglais en repli) —
-c'est au moment de configurer que l'utilisateur en a le plus besoin. Gardez
-les courtes indications d'accueil dans les blocs `section` du `config_schema`
-du manifest ; mettez ici le pas-à-pas détaillé (captures d'écran, dépannage…).
+Affiche une ventilation double flux **Danfoss Air** (Air a2, a3, w2…
+équipée du **CCM**, Connection and Control Module) dans Gladys, par votre
+réseau local, sans cloud ni compte. Intégration non officielle, **sans lien
+avec Danfoss**. **Jamais testé avec un vrai appareil** : elle suit le
+protocole tel que le parle la bibliothèque libre pydanfossair (utilisée par
+Home Assistant) ; merci de signaler ce que vous constatez.
+
+## Avant de commencer
+
+- Le CCM doit être sur votre réseau (Ethernet) et joignable depuis Gladys sur
+  le **port TCP 30046**. Donnez-lui une adresse IP fixe dans votre routeur.
+- Le CCM n’a **pas de mot de passe** et n’accepte **qu’une connexion à la
+  fois** : gardez-le sur un réseau de confiance, et fermez l’application
+  Danfoss Air (ou une autre domotique qui le lit) si Gladys ne peut pas s’y
+  connecter.
+
+## Installation
+
+1. Installez l’intégration depuis le store de Gladys.
+2. Saisissez l’**adresse IP du CCM** (port 30046 sauf si vous en ajoutez un),
+   enregistrez.
+3. Ouvrez l’onglet **Découverte** et ajoutez la centrale.
 
 ## Ce que vous obtenez
 
-Six appareils de démonstration apparaissent après l'installation : une
-station météo (vraies données Open-Meteo), un interrupteur, une lampe
-variable, une prise connectée avec mesure de puissance, un détecteur de
-mouvement et une caméra.
+Un appareil, **Ventilation Danfoss Air**, avec :
 
-## Configuration
+| Fonctionnalité                                                                                     | Remarques                                                                                              |
+| -------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
+| Températures de l’air extérieur, soufflé, extrait et rejeté                                        | °C                                                                                                     |
+| Température de la pièce (Air Dial) et température calculée                                         | °C                                                                                                     |
+| Humidité                                                                                           | %                                                                                                      |
+| Débit d’air                                                                                        | %, en lecture seule (il peut apparaître comme un ventilateur dans HomeKit, mais refuse toute commande) |
+| Vitesses des ventilateurs de soufflage et d’extraction                                             | tr/min                                                                                                 |
+| Durée de vie restante du filtre                                                                    | %                                                                                                      |
+| Pile de l’Air Dial                                                                                 | %                                                                                                      |
+| Boost actif, bypass ouvert, bypass automatique, mode absence                                       | lecture seule, 1 = actif                                                                               |
+| Mode de fonctionnement                                                                             | liste : à la demande, programme, manuel                                                                |
+| Palier de ventilation (mode manuel)                                                                | liste : 1 à 10                                                                                         |
+| Démarrer / arrêter le boost, ouvrir / fermer le bypass, activer / désactiver le bypass automatique | boutons                                                                                                |
 
-1. Ouvrez l'onglet **Configuration** de l'intégration.
-2. Renseignez la **latitude** et la **longitude** que la station météo de
-   démonstration doit observer (Paris par défaut), et choisissez votre unité
-   de température. L'**intervalle de rafraîchissement** règle la fréquence
-   de lecture de la station météo et de la puissance de la prise : toutes
-   les 5 minutes par défaut, toutes les minutes au plus.
-3. Enregistrez : les appareils apparaissent dans l'onglet **Découverte**,
-   prêts à être ajoutés.
+La centrale est lue toutes les 60 s (réglable de 30 s à 1 h). Le bouton de
+test, une recherche dans Découverte, une reconnexion de Gladys ou un
+redémarrage de l’intégration ne la relisent jamais avant l’intervalle.
 
-Le réglage **Préférer la connexion locale** pilote la prise de
-démonstration : elle affiche en badge le canal réellement utilisé (local ou
-cloud), avec un point orange quand elle fonctionne en mode dégradé (local
-refusé, bascule cloud).
+## Commandes
 
-## Actions
+Toutes les commandes sauf **Arrêter le boost** sont refusées tant que
+**Autoriser les commandes** n’est pas activé (désactivé par défaut). Aucun
+interrupteur : un « éteins tout » d’un assistant vocal n’atteint jamais la
+ventilation.
 
-- **Tester le fournisseur météo** — effectue une requête en direct vers
-  Open-Meteo et affiche la température et l'humidité actuelles sous le
-  bouton.
-- **Identifier un appareil** — choisissez un de vos appareils dans la liste
-  et il se signale (la lampe de démonstration « clignote » dans les logs).
+- Chaque commande relit le registre juste avant de l’écrire, n’écrit rien
+  quand la valeur est déjà la bonne, et n’est confirmée que si la valeur
+  relue est celle demandée. Une commande qui a pu atteindre la centrale sans
+  être confirmée répond « envoyée, sans confirmation » : vérifiez la
+  centrale quelques secondes plus tard. Une commande qui ne peut pas être
+  écrite dans les 3,5 s est refusée et rien n’est envoyé.
+- Le palier ne se règle qu’en mode **manuel** (choisissez d’abord le mode).
+- **Arrêter le boost** est toujours possible : jamais bloqué par l’option,
+  par une autre commande ni par une lecture en cours, il annule une commande
+  pas encore envoyée. S’il n’est pas confirmé, les lectures des deux minutes
+  suivantes le renvoient (deux fois au plus) tant que le boost reste actif.
+- Ouvrir le bypass arrête la récupération de chaleur (air neuf non
+  réchauffé) : à réserver à l’été.
 
-## Scènes
+## Limites
 
-L'intégration ajoute ses propres cartes à l'éditeur de scènes (Gladys 5.1
-ou plus récent), dans la catégorie **Intégrations** :
+- Le protocole n’est pas documenté par Danfoss ; seuls les registres lus et
+  écrits par pydanfossair sont utilisés.
+- Le protocole ne donne pas de numéro de série : l’intégration affiche une
+  centrale, celle de l’adresse saisie. Changer l’adresse garde l’appareil et
+  son historique ; une autre centrale mise à la même adresse apparaîtrait
+  sur le même appareil.
+- Gladys occupe la connexion pendant sa lecture (environ une seconde à
+  chaque intervalle) : l’application Danfoss Air peut devoir attendre, et
+  inversement.
+- La température de la pièce et la pile viennent de la télécommande Air
+  Dial ; sans elle, elles peuvent rester vides.
 
-- **Mouvement détecté** (déclencheur) — lance la scène quand un détecteur
-  de démonstration voit bouger quelque chose. Choisissez éventuellement le
-  détecteur et ce qui a bougé (personne, animal) ; laissés vides, toute
-  détection correspond. Les actions suivantes peuvent lire ce qui a bougé
-  avec `{{triggerEvent.data.target}}`.
-- **Identifier un appareil** (action) — fait se signaler l'appareil choisi.
-  Elle indique si l'appareil a pu se signaler, pour que les actions
-  suivantes puissent en dépendre.
+## Confidentialité
 
-## Tableau de bord
-
-Ajoutez le widget **État de la démo** à un tableau de bord : il affiche en
-direct la température de la station météo et la puissance de la prise du
-bureau, la connexion utilisée par la prise (en orange si dégradée) et la
-position observée. Son bouton **Identifier la lampe** fait se signaler la
-lampe de démonstration.
-
-## Dépannage
-
-L'intégration journalise tout ce qu'elle fait : consultez les logs de
-l'intégration depuis l'interface Gladys (ou `docker logs` sur l'hôte) avec
-`LOG_LEVEL=debug` pour le détail complet.
+Rien ne sort de votre réseau. L’intégration ne garde que l’heure de sa
+dernière lecture dans son volume `/data`.

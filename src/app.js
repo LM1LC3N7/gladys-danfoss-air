@@ -1,0 +1,1077 @@
+// -----------------------------------------------------------------------------
+// The integration: the CCM typed in the configuration (its IP address), one
+// read of its registers every poll interval over one TCP connection, the
+// Gladys device and its states, the transport badge, the "Test the
+// connection" button, and the commands. index.js only wires the SDK handlers
+// to it (src/handlers.js).
+//
+// The CCM accepts one connection at a time: one session at a time (the
+// "line"). A command takes the line from a poll (the poll is dropped, nothing
+// of it published); "Stop the boost" takes it from anything.
+//
+// Reads follow the rules learnt on the previous modules:
+//   - never sooner than the interval after the last one: not for the test
+//     button, a Discovery scan, a reconnection to Gladys, a configuration
+//     saved unchanged, nor a restart of the container (the time of the last
+//     read is kept in /data, written at most once a minute, BEFORE the read);
+//     a reconnection during a read joins it;
+//   - an answer that arrives for an old configuration (generation) publishes
+//     nothing and sets no status; a read begun before a command left is not
+//     applied; a value not read this time is never republished as new.
+//
+// Commands (mode, manual fan step, boost start, bypass, automatic bypass):
+//   - refused unless "Allow the commands" is on, checked on arrival and again
+//     right before the write (nothing runs in between);
+//   - decided on a fresh read of the register in the same session (and of the
+//     mode for the fan step), never on the state in memory; refused when that
+//     value cannot be read; not written when already so (unless a guard says
+//     a previous command may not show yet);
+//   - written within 3.5 s of the click or refused unsent; confirmed only by a
+//     read back equal to the value asked, by 4.3 s; else "sent, without
+//     confirmation" and spaced reads; never retried; one at a time;
+//   - the ack never waits for a publication to Gladys.
+// "Stop the boost" protects: never held back by the option, another command,
+// a failed read or a backoff (one try); possible before the first read after
+// a restart; cancels a command not written yet; reaffirmed (twice at most) by
+// the reads of the next two minutes when it was not confirmed.
+// -----------------------------------------------------------------------------
+
+import { DEVICE_TRANSPORTS, createLogger } from '@gladysassistant/integration-sdk';
+import { addressKey, normalizeConfig } from './config.js';
+import {
+  COMMANDS,
+  FEATURES,
+  LIMITS,
+  PRESSED,
+  READS,
+  READ_OF,
+  SECOND,
+  TIMINGS,
+} from './constants.js';
+import { ERROR_KINDS, CcmError, errorReason, openSession, tcpConnect } from './danfoss/client.js';
+import { decode, writeFrame } from './danfoss/protocol.js';
+import { buildDevice, commandOf, deviceStates, parseFeatureId, unitIds } from './devices.js';
+import { ERRORS, T, age, join, word } from './i18n.js';
+import { StatePublisher } from './publisher.js';
+import { fileStore, normalizeMemory } from './store.js';
+
+const both = (en, fr) => ({ en, fr });
+
+/** A refusal: the message Gladys shows. */
+class Refusal extends Error {}
+
+const freshUnit = () => ({
+  /** The values of the last read (only those read that time). */
+  values: undefined,
+  online: undefined,
+  failures: 0,
+  wait: undefined,
+  error: undefined,
+  timer: undefined,
+  running: undefined,
+  followUps: new Set(),
+});
+
+export class DanfossAirApp {
+  constructor({
+    gladys,
+    logger = createLogger({ name: 'danfoss-air' }),
+    connect = tcpConnect,
+    now = Date.now,
+    timers = globalThis,
+    store = fileStore(),
+  }) {
+    this.gladys = gladys;
+    this.logger = logger;
+    this.connect = connect;
+    this.now = now;
+    this.timers = timers;
+    this.store = store;
+    this.publisher = new StatePublisher({ gladys, logger, now, timers });
+    this.config = normalizeConfig();
+    this.memory = normalizeMemory(null, now());
+    this.unit = freshUnit();
+    this.generation = 0;
+    this.started = false;
+    /** The time of the last read sent to the CCM (exact; /data keeps it within a minute). */
+    this.lastAttemptAt = -Infinity;
+    this.lastStatus = undefined;
+    this.published = undefined;
+    this.badge = undefined;
+    /** The session on the line: { kind: 'read' | 'command' | 'protect', abort(), done }. */
+    this.active = undefined;
+    /** Commands getting ready to take the line (a poll does not start meanwhile). */
+    this.reserved = 0;
+    /** The command in flight (one at a time), and the boost stop in flight. */
+    this.inFlight = undefined;
+    this.protecting = undefined;
+    /** Counts the boost stops: a command that sees it change before its write gives way. */
+    this.protectSeq = 0;
+    /** When the last write left (a read begun before it is not applied). */
+    this.lastSentAt = -Infinity;
+    /** When the last boost start left. */
+    this.lastBoostStartAt = -Infinity;
+    /** Read key -> { from, expected, moved, until }: a command sent, not seen yet. */
+    this.guards = new Map();
+    /** A boost stop not confirmed: { sentAt, until, reasserts }. */
+    this.stopGuard = undefined;
+    /** Register key -> timeouts in a row while the unit answered the others. */
+    this.timeouts = new Map();
+    this.skipped = new Set();
+  }
+
+  // --- Lifecycle -------------------------------------------------------------
+
+  /**
+   * `fresh`: started for a new address while running (a read may go at
+   * once); otherwise (container start) the first read waits for the
+   * interval after the last read kept in /data.
+   */
+  async start(raw = {}, { fresh = false } = {}) {
+    this.stop();
+    await this.unit.running;
+    const generation = this.generation;
+    this.config = normalizeConfig(raw);
+    this.memory = normalizeMemory(await this.store.load().catch(() => null), this.now());
+    if (generation !== this.generation) {
+      return;
+    }
+    this.unit = freshUnit();
+    this.timeouts.clear();
+    this.skipped.clear();
+    this.published = undefined;
+    this.badge = undefined;
+    this.lastStatus = undefined;
+    this.publisher.start();
+    if (!this.config.address) {
+      // The device already created is shown unreachable.
+      await this.publishAll();
+      return;
+    }
+    await this.setStatus(false, this.status());
+    const wait = fresh ? 0 : this.firstWait();
+    if (wait > 0) {
+      this.schedule(wait);
+      await this.publishAll();
+      return;
+    }
+    await this.tick();
+  }
+
+  /** The wait before the first read after a container start, from the time kept in /data. */
+  firstWait() {
+    const stored = this.memory.lastAttemptAt;
+    if (stored === null) {
+      return 0;
+    }
+    this.lastAttemptAt = Math.max(this.lastAttemptAt, stored);
+    // A read may have left up to a minute after the time kept (written at most once a minute).
+    const due = stored + TIMINGS.attemptWriteEvery + this.interval;
+    return Math.min(this.interval, Math.max(0, due - this.now()));
+  }
+
+  stop() {
+    this.generation += 1;
+    this.clearTimer();
+    for (const handle of this.unit.followUps) {
+      this.timers.clearTimeout(handle);
+    }
+    this.unit.followUps.clear();
+    this.active?.abort('stopped');
+    this.publisher.stop();
+  }
+
+  clearTimer() {
+    if (this.unit.timer) {
+      this.timers.clearTimeout(this.unit.timer);
+      this.unit.timer = undefined;
+    }
+  }
+
+  /**
+   * Connected to Gladys. The first time, start; after a reconnection, resend
+   * what Gladys keeps in memory only (status, Discovery list, badge) and the
+   * last states, without reading the unit.
+   */
+  async connected(raw = {}) {
+    if (!this.started) {
+      this.started = true;
+      await this.start(raw);
+      return;
+    }
+    if (this.needsRestart(raw)) {
+      await this.start(raw, { fresh: true });
+      return;
+    }
+    const previous = this.config;
+    this.config = normalizeConfig(raw);
+    this.published = undefined;
+    this.badge = undefined;
+    this.lastStatus = undefined;
+    this.gladys.forgetPublishedStates?.();
+    this.rescheduleOnNewInterval(previous);
+    await this.publishAll();
+  }
+
+  /** Only a new address restarts (an interval only reschedules). */
+  needsRestart(raw) {
+    const next = normalizeConfig(raw);
+    return (
+      JSON.stringify(next.address ?? null) !== JSON.stringify(this.config.address ?? null) ||
+      next.invalid !== this.config.invalid
+    );
+  }
+
+  /** A new interval: the next read follows it, counted from the last read. */
+  rescheduleOnNewInterval(previous) {
+    const u = this.unit;
+    if (
+      this.config.pollInterval !== previous.pollInterval &&
+      this.config.address &&
+      !u.running &&
+      u.online !== false &&
+      u.timer
+    ) {
+      this.schedule();
+    }
+  }
+
+  async configUpdated(raw = {}) {
+    if (this.needsRestart(raw)) {
+      await this.start(raw, { fresh: true });
+      return;
+    }
+    const previous = this.config;
+    this.config = normalizeConfig(raw);
+    this.rescheduleOnNewInterval(previous);
+    if (this.config.allowCommands !== previous.allowCommands) {
+      this.logger.info(
+        `Danfoss Air commands ${this.config.allowCommands ? 'allowed' : 'disabled'}`,
+      );
+    }
+    if (this.config.language !== previous.language) {
+      this.published = undefined;
+      await this.publishAll();
+    }
+  }
+
+  async setStatus(connected, message) {
+    const key = JSON.stringify([connected, message ?? null]);
+    if (key === this.lastStatus) {
+      return;
+    }
+    this.lastStatus = key;
+    await this.gladys
+      .setConnectionStatus(connected, message)
+      .catch((err) => this.logger.warn(`setConnectionStatus failed: ${err.message}`));
+  }
+
+  async saveMemory() {
+    await this.store
+      .save(this.memory)
+      .catch((err) => this.logger.warn(`Saving the state to /data failed: ${err.message}`));
+  }
+
+  // --- The line (one connection to the CCM at a time) --------------------------
+
+  /** Runs `fn(session)` on its own connection; the line is held until it ends. */
+  async useLine(kind, timeoutMs, fn) {
+    let finish;
+    const record = {
+      kind,
+      aborted: false,
+      opener: undefined,
+      session: undefined,
+      done: new Promise((resolve) => {
+        finish = resolve;
+      }),
+      abort: (message) => {
+        record.aborted = true;
+        record.opener?.abort();
+        record.session?.abort(message);
+      },
+    };
+    this.active = record;
+    try {
+      record.opener = openSession({
+        host: this.config.address.host,
+        port: this.config.address.port,
+        connect: this.connect,
+        timeoutMs,
+        timers: this.timers,
+        now: this.now,
+      });
+      const session = await record.opener.promise;
+      record.session = session;
+      if (record.aborted) {
+        session.abort();
+        throw new CcmError(ERROR_KINDS.ABORTED, 'line taken');
+      }
+      return await fn(session, record);
+    } finally {
+      record.session?.close();
+      if (this.active === record) {
+        this.active = undefined;
+      }
+      finish();
+    }
+  }
+
+  /** Ends the session on the line when it is one of `kinds`, and waits for its end. */
+  async takeLine(kinds) {
+    const current = this.active;
+    if (current && kinds.includes(current.kind)) {
+      current.abort('line taken');
+      await current.done;
+    }
+  }
+
+  // --- Polling ---------------------------------------------------------------
+
+  get interval() {
+    return this.config.pollInterval * SECOND;
+  }
+
+  /** The earliest time the next polling read may go: the interval after the last one. */
+  get due() {
+    return this.lastAttemptAt + this.interval;
+  }
+
+  /** The next read: after its backoff, else the interval; never sooner than the interval after the last read. */
+  schedule(delay) {
+    const u = this.unit;
+    this.clearTimer();
+    let wait = delay ?? (u.online === false ? u.wait : this.interval);
+    // Capped at the interval: a clock set back never stops the reads.
+    wait = Math.max(wait ?? this.interval, Math.min(this.interval, this.due - this.now()), 0);
+    const generation = this.generation;
+    u.timer = this.timers.setTimeout(() => {
+      u.timer = undefined;
+      if (generation === this.generation) {
+        this.tick().catch(() => this.logger.error('Danfoss Air refresh failed'));
+      }
+    }, wait);
+  }
+
+  /** One read at a time: a tick during a read joins it. */
+  tick() {
+    const u = this.unit;
+    if (!u.running) {
+      u.running = this.run().finally(() => {
+        u.running = undefined;
+      });
+    }
+    return u.running;
+  }
+
+  /**
+   * Keeps the time of this read; when the write of the minute is due, in
+   * /data BEFORE the read (a container stopped during the read keeps it). At
+   * most one write a minute.
+   */
+  async noteAttempt() {
+    const now = this.now();
+    this.lastAttemptAt = now;
+    const stored = this.memory.lastAttemptAt;
+    if (stored === null || now - stored >= TIMINGS.attemptWriteEvery) {
+      this.memory.lastAttemptAt = now;
+      await this.saveMemory();
+    }
+  }
+
+  async run() {
+    const generation = this.generation;
+    if (!this.config.address) {
+      return;
+    }
+    if (this.active || this.reserved > 0) {
+      // A command holds the line: the poll waits for the next turn.
+      this.schedule();
+      return;
+    }
+    const startedAt = this.now();
+    await this.noteAttempt();
+    if (generation !== this.generation) {
+      return;
+    }
+    if (this.active || this.reserved > 0) {
+      this.schedule();
+      return;
+    }
+    let values;
+    let failure;
+    try {
+      values = await this.useLine('read', TIMINGS.connectTimeout, (session) =>
+        this.readAll(session),
+      );
+    } catch (err) {
+      failure = err;
+    }
+    if (generation !== this.generation) {
+      return;
+    }
+    let delay;
+    if (failure?.kind === ERROR_KINDS.ABORTED) {
+      // A command took the line: nothing of this read is applied.
+      this.logger.debug('Danfoss Air: read dropped, a command took the line');
+    } else if (failure) {
+      delay = this.failed(failure);
+    } else if (startedAt <= this.lastSentAt) {
+      // Begun before a command left: it may show the state before it.
+      this.logger.debug('Danfoss Air: read begun before a command, not applied');
+    } else {
+      this.applyRead(values);
+    }
+    await this.publishAll();
+    if (generation === this.generation) {
+      this.schedule(delay);
+    }
+  }
+
+  /**
+   * Every register, one after the other. A register that times out while
+   * the unit answered the ones before ends the read (the late answer could be
+   * taken for the next one): what was read is kept, and after three such
+   * reads in a row that register is skipped until a restart.
+   */
+  async readAll(session) {
+    const values = {};
+    let answered = 0;
+    for (const register of READS) {
+      if (this.skipped.has(register.key)) {
+        continue;
+      }
+      let frame;
+      try {
+        frame = await session.request(register.frame, { timeoutMs: TIMINGS.requestTimeout });
+      } catch (err) {
+        if (err.kind === ERROR_KINDS.TIMEOUT && answered > 0) {
+          const count = (this.timeouts.get(register.key) ?? 0) + 1;
+          this.timeouts.set(register.key, count);
+          if (count >= LIMITS.registerTimeouts) {
+            this.skipped.add(register.key);
+            this.logger.warn(
+              `Danfoss Air: register ${register.key} never answers, not read until a restart`,
+            );
+          } else {
+            this.logger.warn(`Danfoss Air: register ${register.key} did not answer`);
+          }
+          return values;
+        }
+        throw err;
+      }
+      answered += 1;
+      this.timeouts.delete(register.key);
+      const value = decode(register.decode, frame);
+      if (value !== undefined) {
+        values[register.key] = value;
+      }
+    }
+    return values;
+  }
+
+  /** A read: the values of this read only (a value not read is unknown). */
+  applyRead(values) {
+    const u = this.unit;
+    u.online = true;
+    u.failures = 0;
+    u.wait = undefined;
+    u.error = undefined;
+    u.values = values;
+    this.observe(values);
+  }
+
+  /** A failed read: the delay before the next one. */
+  failed(err) {
+    const u = this.unit;
+    const reason = errorReason(err);
+    const wait = Math.max(
+      this.interval,
+      TIMINGS.backoff[Math.min(u.failures, TIMINGS.backoff.length - 1)],
+    );
+    u.failures += 1;
+    u.online = false;
+    u.wait = wait;
+    u.error = reason;
+    this.logger.warn(`Danfoss Air: ${reason}; next try in ${Math.round(wait / 1000)} s`);
+    return wait;
+  }
+
+  /** The connection status of the configuration screen. */
+  status() {
+    const u = this.unit;
+    const c = this.config;
+    if (!c.address) {
+      return c.invalid ? T.invalid(c.invalid) : T.noHost;
+    }
+    if (u.online === false) {
+      const wait = age(u.wait ?? this.interval);
+      return [ERROR_KINDS.UNREACHABLE, ERROR_KINDS.TIMEOUT, ERROR_KINDS.CLOSED].includes(u.error)
+        ? T.unreachable(addressKey(c.address), wait)
+        : T.failing(u.error ?? 'error', wait);
+    }
+    if (u.online === undefined) {
+      return u.timer && this.due > this.now()
+        ? T.waiting(age(this.due - this.now()))
+        : T.connecting;
+    }
+    return T.connected(T.summary(u.values ?? {}));
+  }
+
+  async updateStatus() {
+    await this.setStatus(this.unit.online === true && Boolean(this.config.address), this.status());
+  }
+
+  // --- Gladys ----------------------------------------------------------------
+
+  createdDevice() {
+    const id = unitIds(this.gladys).device;
+    return (this.gladys.devices ?? []).find((d) => d?.external_id === id);
+  }
+
+  async publishAll() {
+    const generation = this.generation;
+    await this.publishDevices();
+    if (generation !== this.generation) {
+      return;
+    }
+    this.queueStates();
+    await this.flush();
+    if (generation !== this.generation) {
+      return;
+    }
+    await this.publishBadge();
+    if (generation !== this.generation) {
+      return;
+    }
+    await this.updateStatus();
+  }
+
+  async flush() {
+    await this.publisher
+      .flush()
+      .catch((err) => this.logger.warn(`Sending to Gladys failed: ${err.message}`));
+  }
+
+  /** The device, once the unit answered (every feature, always). */
+  async publishDevices() {
+    if (this.unit.online !== true) {
+      return;
+    }
+    const devices = [buildDevice(this.gladys, { language: this.config.language })];
+    const json = JSON.stringify(devices);
+    if (json === this.published) {
+      return;
+    }
+    try {
+      await this.gladys.publishDiscoveredDevices(devices);
+      this.published = json;
+    } catch (err) {
+      this.logger.warn(`Publishing the discovered devices failed: ${err.message}`);
+    }
+  }
+
+  createdFeatures() {
+    return new Set((this.createdDevice()?.features ?? []).map((f) => f?.external_id));
+  }
+
+  /** Pushes the given values (only these) to the created features. */
+  queueValues(values, created = this.createdFeatures()) {
+    for (const { device_feature_external_id: id, ...value } of deviceStates(
+      unitIds(this.gladys),
+      values,
+    )) {
+      if (created.has(id)) {
+        this.publisher.push(id, value);
+      }
+    }
+  }
+
+  queueStates(created) {
+    if (this.unit.online === true && this.unit.values) {
+      this.queueValues(this.unit.values, created);
+    }
+  }
+
+  async publishBadge() {
+    const device = this.createdDevice();
+    const online = this.unit.online;
+    if (!device || (online === undefined && this.config.address)) {
+      return;
+    }
+    const entries = [
+      {
+        external_id: device.external_id,
+        transport: online === true ? DEVICE_TRANSPORTS.LOCAL : DEVICE_TRANSPORTS.UNREACHABLE,
+      },
+    ];
+    const json = JSON.stringify(entries);
+    if (json === this.badge) {
+      return;
+    }
+    try {
+      await this.gladys.publishTransports(entries);
+      this.badge = json;
+    } catch (err) {
+      this.logger.warn(`Transport badge failed: ${err.message}`);
+    }
+  }
+
+  /** A device was created (or updated): send its last values at once. */
+  async deviceCreated(device) {
+    this.badge = undefined;
+    const created = this.createdFeatures();
+    for (const f of device?.features ?? []) {
+      created.add(f?.external_id);
+    }
+    this.queueStates(created);
+    await this.flush();
+    await this.publishBadge();
+  }
+
+  async deviceDeleted(device) {
+    this.badge = undefined;
+    if (typeof device?.external_id === 'string') {
+      this.publisher.forget(device.external_id);
+    }
+  }
+
+  /** The Discovery tab asks for a scan: the device sent again (no read). */
+  async scan() {
+    this.published = undefined;
+    await this.publishDevices();
+  }
+
+  // --- Configuration button ------------------------------------------------------
+
+  /** A read now, unless the last one is more recent than the interval (then its result). */
+  async testConnection() {
+    if (!this.config.address) {
+      return this.status();
+    }
+    const u = this.unit;
+    const current = () => JSON.parse(this.lastStatus ?? '[false,null]')[1] ?? this.status();
+    if (u.running) {
+      await u.running;
+      return current();
+    }
+    if (this.now() < this.due) {
+      const waited = T.waiting(age(this.due - this.now()));
+      return Number.isFinite(this.lastAttemptAt) && u.online !== undefined
+        ? join(join(current(), T.lastRead(age(this.now() - this.lastAttemptAt))), waited)
+        : waited;
+    }
+    this.clearTimer();
+    await this.tick();
+    return current();
+  }
+
+  // --- Commands --------------------------------------------------------------------
+
+  refusal(text) {
+    return new Refusal(word(text, this.config.language));
+  }
+
+  async setValue(_device, feature, value) {
+    // The deadlines count from the arrival of the command, before any wait.
+    const received = this.now();
+    const role = parseFeatureId(feature?.external_id);
+    const command = role ? commandOf(role) : undefined;
+    if (!command) {
+      throw this.refusal(ERRORS.readOnly);
+    }
+    let byte;
+    let expected;
+    if (command.button) {
+      // Strictly 1: null, '', true, 0 or "on" never press a button.
+      if (value !== PRESSED && value !== String(PRESSED)) {
+        throw this.refusal(ERRORS.badButton);
+      }
+      [byte, expected] = command.button;
+    } else {
+      // Strictly one of the values of the select: never trimmed, re-cased nor a number.
+      if (typeof value !== 'string' || !Object.hasOwn(command.values, value)) {
+        throw this.refusal(ERRORS.badValue);
+      }
+      byte = command.values[value];
+      expected = command.read === 'mode' ? value : byte;
+    }
+    if (!this.config.address) {
+      throw this.refusal(ERRORS.noHost);
+    }
+    const plan = { role, command, byte, expected };
+    if (command.protective) {
+      return this.protect(plan, received);
+    }
+    if (!this.config.allowCommands) {
+      throw this.refusal(ERRORS.disabled);
+    }
+    if (this.inFlight) {
+      throw this.refusal(ERRORS.busy);
+    }
+    if (this.protecting) {
+      throw this.refusal(ERRORS.protectMeanwhile);
+    }
+    const promise = this.command(plan, received);
+    this.inFlight = promise;
+    try {
+      return await promise;
+    } finally {
+      if (this.inFlight === promise) {
+        this.inFlight = undefined;
+      }
+    }
+  }
+
+  /** The values a command read or confirmed: in memory and to Gladys in the background. */
+  noteValues(values) {
+    if (this.unit.online !== true || !this.unit.values) {
+      return;
+    }
+    Object.assign(this.unit.values, values);
+    this.observe(values);
+    this.queueValues(values);
+    // Shown in the background: the ack never waits for Gladys.
+    this.flush().catch(() => {});
+  }
+
+  async command(plan, received) {
+    const generation = this.generation;
+    const seq = this.protectSeq;
+    const sendBy = received + TIMINGS.commandSendBy;
+    const answerBy = received + TIMINGS.commandAnswerBy;
+    // The checks before the write, on the latest configuration.
+    const check = () => {
+      if (!this.config.allowCommands) {
+        throw this.refusal(ERRORS.disabled);
+      }
+      if (generation !== this.generation || !this.config.address) {
+        throw this.refusal(ERRORS.configChanged);
+      }
+      if (seq !== this.protectSeq) {
+        throw this.refusal(ERRORS.protectMeanwhile);
+      }
+    };
+    const state = { written: false, seq };
+    this.reserved += 1;
+    try {
+      await this.takeLine(['read']);
+      if (this.active) {
+        throw this.refusal(this.active.kind === 'protect' ? ERRORS.protectMeanwhile : ERRORS.busy);
+      }
+      check();
+      const connectBudget = Math.min(
+        TIMINGS.commandConnectMax,
+        sendBy - TIMINGS.commandMinSend - TIMINGS.commandMinRead - this.now(),
+      );
+      if (connectBudget < TIMINGS.commandMinRead) {
+        throw this.refusal(ERRORS.tooSlow);
+      }
+      return await this.useLine('command', connectBudget, (session) =>
+        this.commandSession(session, plan, { check, sendBy, answerBy, state }),
+      );
+    } catch (err) {
+      throw this.commandError(err, plan, state);
+    } finally {
+      this.reserved -= 1;
+    }
+  }
+
+  /** The answer to Gladys of a command that did not end confirmed. */
+  commandError(err, plan, state) {
+    if (err instanceof Refusal) {
+      return err;
+    }
+    if (err?.beforeSend) {
+      return err;
+    }
+    const reason = errorReason(err);
+    const what = `${plan.role} ${plan.byte}`;
+    // Only the write says whether the command may have left (a read never does).
+    if (!state.written) {
+      this.logger.warn(`Danfoss Air: command NOT sent (${what}): ${reason}`);
+      if (err?.kind === ERROR_KINDS.LATE) {
+        return this.refusal(ERRORS.tooSlow);
+      }
+      if (err?.kind === ERROR_KINDS.ABORTED) {
+        return this.refusal(
+          state.seq !== this.protectSeq ? ERRORS.protectMeanwhile : ERRORS.configChanged,
+        );
+      }
+      return this.refusal(ERRORS.notSent(reason));
+    }
+    return this.unconfirmed(plan, state, reason);
+  }
+
+  /** A command that may have reached the unit: guard, spaced reads, "sent, without confirmation". */
+  unconfirmed(plan, state, reason) {
+    const key = plan.command.read;
+    this.guards.set(key, {
+      from: state.from,
+      expected: plan.expected,
+      moved: false,
+      until: this.now() + TIMINGS.guard,
+    });
+    this.followUp();
+    this.logger.warn(`Danfoss Air: command sent, NOT confirmed (${plan.role}): ${reason}`);
+    return this.refusal(ERRORS.sentUnconfirmed(reason));
+  }
+
+  async commandSession(session, plan, { check, sendBy, answerBy, state }) {
+    const { command } = plan;
+    // The state just before acting, read now in this session, never the one in memory.
+    const needed = command.needsManual ? ['mode', command.read] : [command.read];
+    const fresh = {};
+    for (const key of needed) {
+      const budget = Math.min(TIMINGS.commandReadMax, sendBy - TIMINGS.commandMinSend - this.now());
+      if (budget < TIMINGS.commandMinRead) {
+        throw this.refusal(ERRORS.tooSlow);
+      }
+      let frame;
+      try {
+        frame = await session.request(READ_OF[key].frame, { timeoutMs: budget });
+      } catch (err) {
+        if (err.kind === ERROR_KINDS.ABORTED) {
+          throw err;
+        }
+        throw this.refusal(ERRORS.unknownState(errorReason(err)));
+      }
+      const value = decode(READ_OF[key].decode, frame);
+      if (value === undefined) {
+        throw this.refusal(ERRORS.unknownState(word(both('unreadable', 'illisible'), 'en')));
+      }
+      fresh[key] = value;
+    }
+    check();
+    this.noteValues(fresh);
+    if (command.needsManual && fresh.mode !== 'manual') {
+      throw this.refusal(ERRORS.notManual);
+    }
+    state.from = fresh[command.read];
+    if (state.from === plan.expected && !this.guardActive(command.read)) {
+      // Already so: nothing sent.
+      this.logger.info(`Danfoss Air: ${plan.role} already so, nothing sent`);
+      return;
+    }
+    this.logger.info(`Danfoss Air: ${plan.role} (${plan.byte})`);
+    await session.request(writeFrame(command.register, plan.byte), {
+      timeoutMs: Math.max(100, answerBy - this.now()),
+      startBy: sendBy,
+      beforeSend: () => {
+        // The option, the configuration and a boost stop, checked right before the write.
+        check();
+        state.written = true;
+        this.lastSentAt = this.now();
+        if (plan.role === FEATURES.BOOST_START) {
+          this.lastBoostStartAt = this.now();
+        }
+      },
+    });
+    // Confirmed only by the register read back equal to the value asked.
+    const left = answerBy - this.now();
+    if (left < 50) {
+      throw new CcmError(ERROR_KINDS.TIMEOUT, 'no time left to read back', { sent: true });
+    }
+    const back = decode(
+      READ_OF[command.read].decode,
+      await session.request(READ_OF[command.read].frame, { timeoutMs: left }),
+    );
+    if (back !== plan.expected) {
+      if (back !== undefined) {
+        this.noteValues({ [command.read]: back });
+      }
+      throw new CcmError(ERROR_KINDS.PROTOCOL, 'read back differs', { sent: true });
+    }
+    this.guards.delete(command.read);
+    this.noteValues({ [command.read]: back });
+    this.logger.info(`Danfoss Air: ${plan.role} confirmed by the unit`);
+  }
+
+  // --- The boost stop (protective) -----------------------------------------------
+
+  /** A second press while one runs joins it. */
+  async protect(plan, received) {
+    if (this.protecting) {
+      return this.protecting;
+    }
+    const promise = this.sendStop(plan, received);
+    this.protecting = promise;
+    try {
+      return await promise;
+    } finally {
+      if (this.protecting === promise) {
+        this.protecting = undefined;
+      }
+    }
+  }
+
+  /**
+   * Never held back: takes the line from anything, one try, without a fresh
+   * read; the register read back confirms it. Answered by 4.3 s; still
+   * running then, it goes on (bounded) and the answer is "sent, without
+   * confirmation".
+   */
+  async sendStop(plan, received) {
+    // A command not written yet gives way (checked right before its write).
+    this.protectSeq += 1;
+    const state = { written: false, sentAt: undefined };
+    this.reserved += 1;
+    const sending = (async () => {
+      try {
+        await this.takeLine(['read', 'command', 'protect']);
+        return await this.useLine('protect', TIMINGS.connectTimeout, async (session) => {
+          await session.request(writeFrame(plan.command.register, plan.byte), {
+            beforeSend: () => {
+              state.written = true;
+              state.sentAt = this.now();
+              this.lastSentAt = this.now();
+            },
+          });
+          return decode(
+            READ_OF[plan.command.read].decode,
+            await session.request(READ_OF[plan.command.read].frame),
+          );
+        });
+      } finally {
+        this.reserved -= 1;
+      }
+    })();
+    this.logger.info('Danfoss Air: boost stop');
+    const answerIn = Math.max(0, received + TIMINGS.commandAnswerBy - this.now());
+    let late;
+    const outcome = await new Promise((resolve) => {
+      late = this.timers.setTimeout(() => resolve({ late: true }), answerIn);
+      sending.then(
+        (back) => resolve({ back }),
+        (err) => resolve({ err }),
+      );
+    });
+    this.timers.clearTimeout(late);
+    if (outcome.back === plan.expected) {
+      this.guards.delete(plan.command.read);
+      this.stopGuard = undefined;
+      this.noteValues({ [plan.command.read]: outcome.back });
+      this.logger.info('Danfoss Air: boost stop confirmed by the unit');
+      return;
+    }
+    // Not confirmed: the reads of the next two minutes reaffirm it.
+    this.keepStopGuard(state.sentAt ?? this.now());
+    this.followUp();
+    if (outcome.late) {
+      sending.catch((err) =>
+        this.logger.warn(`Danfoss Air: boost stop failed after the ack (${errorReason(err)})`),
+      );
+      throw this.refusal(
+        ERRORS.sentUnconfirmed(
+          word(both('no answer yet', 'pas encore de réponse'), this.config.language),
+        ),
+      );
+    }
+    if (outcome.err) {
+      const reason = errorReason(outcome.err);
+      this.logger.warn(`Danfoss Air: boost stop failed (${reason})`);
+      if (!state.written) {
+        throw this.refusal(ERRORS.notSent(reason));
+      }
+      throw this.refusal(ERRORS.sentUnconfirmed(reason));
+    }
+    if (outcome.back !== undefined) {
+      this.noteValues({ [plan.command.read]: outcome.back });
+    }
+    throw this.refusal(
+      ERRORS.sentUnconfirmed(word(both('still on', 'toujours actif'), this.config.language)),
+    );
+  }
+
+  keepStopGuard(sentAt) {
+    if (this.stopGuard && this.now() < this.stopGuard.until) {
+      this.stopGuard.sentAt = Math.max(this.stopGuard.sentAt, sentAt);
+      return;
+    }
+    this.stopGuard = { sentAt, until: this.now() + TIMINGS.stopGuard, reasserts: 0 };
+  }
+
+  // --- Guards --------------------------------------------------------------------
+
+  guardActive(key) {
+    const guard = this.guards.get(key);
+    if (guard && this.now() >= guard.until) {
+      this.guards.delete(key);
+      return false;
+    }
+    return Boolean(guard);
+  }
+
+  /**
+   * A read through the guards: a guard lifts when the value moved from the
+   * start state to the one asked (never on an unknown value); a boost stop
+   * not confirmed is sent again when the boost shows on and no boost start
+   * left after it.
+   */
+  observe(values) {
+    for (const key of [...this.guards.keys()]) {
+      if (!this.guardActive(key) || values[key] === undefined) {
+        continue;
+      }
+      const guard = this.guards.get(key);
+      if (values[key] !== guard.from) {
+        guard.moved = true;
+      }
+      if (guard.moved && values[key] === guard.expected) {
+        this.guards.delete(key);
+      }
+    }
+    const stop = this.stopGuard;
+    if (!stop) {
+      return;
+    }
+    if (this.now() >= stop.until || this.lastBoostStartAt > stop.sentAt) {
+      this.stopGuard = undefined;
+      return;
+    }
+    if (values.boost === false) {
+      this.stopGuard = undefined;
+      return;
+    }
+    if (values.boost === true && !this.protecting && stop.reasserts < TIMINGS.stopReasserts) {
+      stop.reasserts += 1;
+      this.logger.warn('Danfoss Air: the boost is still on after a stop, stop sent again');
+      // Not awaited: the read that saw it goes on.
+      this.timers.setTimeout(() => {
+        this.protect(
+          {
+            role: FEATURES.BOOST_STOP,
+            command: COMMANDS[FEATURES.BOOST_STOP],
+            byte: 0,
+            expected: false,
+          },
+          this.now(),
+        ).catch((err) => this.logger.warn(`Danfoss Air: stop reaffirmed: ${err.message}`));
+      }, 0);
+    }
+  }
+
+  /**
+   * Spaced reads after a command: its effect, then a check. One series
+   * pending at a time (a scene pressing in a loop never multiplies them).
+   */
+  followUp() {
+    const generation = this.generation;
+    const u = this.unit;
+    for (const handle of u.followUps) {
+      this.timers.clearTimeout(handle);
+    }
+    u.followUps.clear();
+    for (const delay of TIMINGS.followUps) {
+      const handle = this.timers.setTimeout(() => {
+        u.followUps.delete(handle);
+        if (generation === this.generation) {
+          Promise.resolve(u.running)
+            .then(() => this.tick())
+            .catch(() => this.logger.error('Danfoss Air refresh failed'));
+        }
+      }, delay);
+      u.followUps.add(handle);
+    }
+  }
+}

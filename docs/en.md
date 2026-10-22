@@ -1,61 +1,82 @@
-# Demo Devices Template
+# Danfoss Air for Gladys
 
-This is the user documentation of the integration. Gladys re-hosts this file
-and shows a permanent **Documentation** link to it in the Configuration screen
-(in the user's language, with English as the fallback) — it is when
-configuring that the user needs it most. Keep the short onboarding hints in
-the `section` blocks of the manifest `config_schema`; put the long
-step-by-step (screenshots, troubleshooting…) here.
+Shows a **Danfoss Air** heat recovery ventilation unit (Air a2, a3, w2…
+fitted with the **CCM**, Connection and Control Module) in Gladys, over your
+local network, without any cloud or account. Unofficial integration, **not
+affiliated with Danfoss**. **Never tested with a real device**: it follows
+the protocol as the open-source library pydanfossair (used by Home
+Assistant) speaks it; please report what you see.
+
+## Before you start
+
+- The CCM must be on your network (Ethernet) and reachable from Gladys on
+  **TCP port 30046**. Give it a fixed IP address in your router.
+- The CCM has **no password** and accepts **one connection at a time**: keep
+  it on a trusted network, and close the Danfoss Air app (or another home
+  automation that reads it) if Gladys cannot connect.
+
+## Setup
+
+1. Install the integration from the Gladys store.
+2. Enter the **IP address of the CCM** (port 30046 unless you add one), save.
+3. Open the **Discovery** tab and add the unit.
 
 ## What you get
 
-Six demo devices show up after installation: a weather station (real data
-from Open-Meteo), a switch, a dimmable light, a smart plug with power
-metering, a motion sensor and a camera.
+One device, **Danfoss Air ventilation**, with:
 
-## Configuration
+| Feature                                                                    | Notes                                                                     |
+| -------------------------------------------------------------------------- | ------------------------------------------------------------------------- |
+| Outdoor, supply, extract and exhaust air temperatures                      | °C                                                                        |
+| Room temperature (Air Dial) and calculated room temperature                | °C                                                                        |
+| Humidity                                                                   | %                                                                         |
+| Airflow                                                                    | %, read only (it may show as a fan in HomeKit, but refuses every command) |
+| Supply and extract fan speeds                                              | rpm                                                                       |
+| Filter life remaining                                                      | %                                                                         |
+| Air Dial battery                                                           | %                                                                         |
+| Boost active, bypass open, automatic bypass, away mode                     | read only, 1 = on                                                         |
+| Operation mode                                                             | list: demand, program, manual                                             |
+| Fan step (manual mode)                                                     | list: 1 to 10                                                             |
+| Start / stop the boost, open / close the bypass, automatic bypass on / off | buttons                                                                   |
 
-1. Open the **Configuration** tab of the integration.
-2. Set the **latitude** and **longitude** the demo weather station should
-   observe (they default to Paris), and pick your temperature unit.
-   The **refresh interval** sets how often the weather station and the
-   plug's power are read: every 5 minutes by default, every minute at most.
-3. Save: the devices appear in the **Discovery** tab, ready to be added.
+The unit is read every 60 s (configurable from 30 s to 1 h). The test
+button, a Discovery scan, a reconnection of Gladys or a restart of the
+integration never read it sooner than the interval.
 
-The **Prefer the local connection** toggle drives the demo plug: it reports
-the channel it actually uses as a badge (local or cloud), with an orange dot
-when it runs degraded (local refused, cloud fallback).
+## Commands
 
-## Actions
+All commands except **Stop the boost** are refused unless **Allow the
+commands** is on (off by default). There is no switch: a "turn everything
+off" of a voice assistant never reaches the ventilation.
 
-- **Test the weather provider** — performs a live request to Open-Meteo and
-  shows the current temperature and humidity under the button.
-- **Identify a device** — pick one of your devices in the list and it will
-  signal itself (the demo light "blinks" in the logs).
+- Each command reads the register again just before writing it, writes
+  nothing when it is already so, and is confirmed only when the value read
+  back is the one asked. A command that may have reached the unit without
+  being confirmed answers "sent, without confirmation": check the unit a few
+  seconds later. A command that cannot be written within 3.5 s is refused
+  and nothing is sent.
+- The fan step can only be set in **manual** mode (choose the mode first).
+- **Stop the boost** is always allowed: it is never held back by the option,
+  by another command or by a read in progress, and cancels a command not
+  sent yet. If it is not confirmed, the reads of the following two minutes
+  send it again (twice at most) while the boost shows on.
+- Opening the bypass stops the heat recovery (fresh air not warmed): use it
+  in summer.
 
-## Scenes
+## Limits
 
-The integration adds its own cards to the scene editor (Gladys 5.1 or
-later), under the **Integrations** category:
+- The protocol is not documented by Danfoss; only the registers read and
+  written by pydanfossair are used.
+- The protocol gives no serial number: the integration shows one unit, the
+  one at the configured address. Changing the address keeps the device and
+  its history; another unit put at the same address would show on the same
+  device.
+- Gladys holds the connection while it reads (about a second every
+  interval): the Danfoss Air app may have to wait, and conversely.
+- The room temperature and battery come from the Air Dial remote; without
+  one they may stay empty.
 
-- **Motion detected** (trigger) — starts the scene when a demo motion sensor
-  sees something move. Optionally pick the sensor and what moved (person,
-  animal); left empty, any detection matches. The following actions can
-  read what moved with `{{triggerEvent.data.target}}`.
-- **Identify a device** (action) — makes the chosen device signal itself.
-  It returns whether the device could signal itself, so the following
-  actions can depend on it.
+## Privacy
 
-## Dashboard
-
-Add the **Demo status** widget to a dashboard: it shows the live
-temperature of the weather station and the power of the office plug, the
-connection the plug currently uses (orange when degraded) and the observed
-location. Its **Identify the light** button makes the demo light signal
-itself.
-
-## Troubleshooting
-
-The integration logs everything it does: check the integration logs from the
-Gladys UI (or `docker logs` on the host) with `LOG_LEVEL=debug` for the full
-detail.
+Nothing leaves your network. The integration keeps only the time of its last
+read in its `/data` volume.
