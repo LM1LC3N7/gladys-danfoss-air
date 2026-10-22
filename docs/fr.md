@@ -68,8 +68,11 @@ ventilation.
   les lectures des deux minutes suivantes le renvoient (deux fois au plus)
   tant que le boost reste actif ; un « Démarrer le boost » demandé ensuite
   l’emporte et n’est jamais défait.
-- **Centrale arrêtée** depuis l’Air Dial : le statut l’indique, les listes
-  ne changent pas, et les commandes de mode et de palier sont refusées.
+- **Centrale arrêtée** depuis l’Air Dial (mode 3, ou palier lu à 0) : le
+  statut l’indique, les listes ne changent pas, et les commandes de mode, de
+  palier et « Démarrer le boost » sont refusées. Les commandes du bypass
+  partent telles quelles (elles déplacent un volet, elles ne relancent pas
+  les ventilateurs) ; « Arrêter le boost » reste toujours possible.
   Gladys n’arrête ni ne relance la ventilation dans cette version (couper
   une double flux arrête le renouvellement d’air).
 - Ouvrir le bypass arrête la récupération de chaleur (air neuf non

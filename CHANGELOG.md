@@ -34,9 +34,10 @@ the notes of the version's GitHub Release.
   shifted from one register to the next).
 - A unit stopped from the Air Dial (mode 3) is shown in the status; mode and
   fan step commands are then refused. Gladys never stops nor restarts the
-  ventilation.
-- State registers are read at every poll; a measure that never answers is
-  tried again every hour.
+  ventilation: a step read 0 refuses the fan step, and the boost start reads
+  the mode first and is refused on a stopped unit.
+- State registers are read at every poll (one that timed out is read last
+  the next time); a measure that never answers is tried again every hour.
 - "Test the connection" button; documentation in English and French;
   `LICENSE` and `THIRD_PARTY_NOTICES.md` shipped in the image.
 

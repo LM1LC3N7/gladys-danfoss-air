@@ -65,8 +65,11 @@ off" of a voice assistant never reaches the ventilation.
   reads of the following two minutes send it again (twice at most) while
   the boost shows on; a "Start the boost" pressed afterwards wins and is
   never undone.
-- **Unit stopped** from the Air Dial: the status says so, the lists do not
-  change, and mode and fan step commands are refused. Gladys neither stops
+- **Unit stopped** from the Air Dial (mode 3, or step read 0): the status
+  says so, the lists do not change, and the mode, fan step and "Start the
+  boost" commands are refused. The bypass commands are sent as they are
+  (they move a damper, they do not start the fans); "Stop the boost" is
+  always allowed. Gladys neither stops
   nor restarts the ventilation in this version (stopping a heat recovery
   unit stops the air renewal).
 - Opening the bypass stops the heat recovery (fresh air not warmed): use it

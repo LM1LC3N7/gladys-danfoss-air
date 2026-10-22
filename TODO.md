@@ -40,7 +40,12 @@ up to date at the end of every milestone.
   (endpoint 0, register 0x0016). If one is reliable: keep it in /data,
   refuse the commands (except the boost stop) when another serial is read,
   never treat an unreadable value as another unit. The external ids stay.
-- That mode 3 is a unit stopped from the Air Dial and the step reads 0 then.
+- That mode 3 is a unit stopped from the Air Dial and the step reads 0 then;
+  whether a bypass command on a stopped unit does more than move the damper.
+- Whether a state register (mode, step, boost, bypass, automatic bypass,
+  away) never answers on some firmware: each read then stops at it (it is
+  read last at the next read, so the measures still come); pydanfossair
+  would block there too.
 - How fast the CCM answers 18 reads; whether it drops the connection when
   the Danfoss app connects meanwhile; how long it refuses a new connection
   after one closes (a command right after a poll).
@@ -93,8 +98,11 @@ up to date at the end of every milestone.
   value never a switch, docs fr/en, and a restart (off to demand) never held
   back. A unit stopped from the Air Dial is read (mode 3 as `off`, step 0,
   the value openHAB's binding names OFF, nothing copied), shown in the
-  status; the lists keep their options; mode and fan step commands are
-  refused with a precise message.
+  status; the lists keep their options; mode, fan step and boost start
+  commands (whose fresh read includes the mode) are refused with a precise
+  message when the mode reads 3 or the step reads 0 (approval 1, R1/R2).
+  The bypass commands go as they are on a stopped unit (a damper, not the
+  fans), documented; the boost stop is never checked.
 - **Lifecycle**: `start()` sets the configuration synchronously (a
   `connected` or a configuration saved meanwhile compares with it) and
   checks the generation after each await; `stop()` clears the guards, the

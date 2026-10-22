@@ -111,7 +111,13 @@ export const COMMANDS = {
     values: Object.fromEntries(FAN_STEPS.map((s) => [s, Number(s)])),
     needsManual: true,
   },
-  [FEATURES.BOOST_START]: { register: [0x15, 0x30], read: 'boost', button: [1, true] },
+  // A boost may start the fans again: the mode is read first, refused on a stopped unit.
+  [FEATURES.BOOST_START]: {
+    register: [0x15, 0x30],
+    read: 'boost',
+    button: [1, true],
+    needsRunning: true,
+  },
   [FEATURES.BOOST_STOP]: {
     register: [0x15, 0x30],
     read: 'boost',

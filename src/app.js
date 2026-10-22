@@ -481,12 +481,15 @@ export class DanfossAirApp {
    * taken for the next one): what was read is kept. A state register (mode,
    * step, boost, bypass, away) is never skipped; a measure that times out
    * three reads in a row is skipped, and tried again every hour (one log
-   * line when it is skipped).
+   * line when it is skipped). A state register that timed out is read last
+   * at the next read, so the measures after it are still read.
    */
   async readAll(session) {
     const values = {};
     let answered = 0;
-    for (const register of READS) {
+    const late = (r) => STATE_KEYS.has(r.key) && this.timeouts.has(r.key);
+    const order = [...READS.filter((r) => !late(r)), ...READS.filter(late)];
+    for (const register of order) {
       const skippedUntil = this.skipped.get(register.key);
       if (skippedUntil !== undefined && this.now() < skippedUntil) {
         continue;
@@ -875,7 +878,8 @@ export class DanfossAirApp {
   async commandSession(session, plan, { check, sendBy, answerBy, state }) {
     const { command } = plan;
     // The state just before acting, read now in this session, never the one in memory.
-    const needed = command.needsManual ? ['mode', command.read] : [command.read];
+    const needed =
+      command.needsManual || command.needsRunning ? ['mode', command.read] : [command.read];
     const fresh = {};
     for (const key of needed) {
       const budget = Math.min(TIMINGS.commandReadMax, sendBy - TIMINGS.commandMinSend - this.now());
@@ -903,7 +907,8 @@ export class DanfossAirApp {
     check();
     // A fresh read of a command never reaffirms a boost stop.
     this.noteValues(fresh, { fromCommand: true });
-    if (fresh.mode === 'off') {
+    // A stopped unit (mode 3, or step 0 read) is never restarted by Gladys.
+    if (fresh.mode === 'off' || fresh.fanStep === 0) {
       throw this.refusal(ERRORS.unitOff);
     }
     if (command.needsManual && fresh.mode !== 'manual') {

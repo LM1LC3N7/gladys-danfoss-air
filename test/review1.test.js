@@ -294,3 +294,46 @@ test('M5: a new address clears the stop guard of the old one', async (t) => {
   await saved;
   assert.equal(ctx.app.stopGuard, undefined);
 });
+
+// --- Approval 1 --------------------------------------------------------------------
+
+test('R1 (S5e): manual mode with the step read 0: a fan step is refused, nothing written', async (t) => {
+  const unit = fakeCcm();
+  unit.registers['1412'] = [2];
+  unit.registers['1561'] = [0];
+  const ctx = await setup(t, { unit, config: ALLOW });
+  const ack = await ctx.press('fan-step', '5');
+  assert.equal(ack.success, false);
+  assert.match(String(ack.error), /arrêtée/);
+  assert.deepEqual(ctx.unit.writes(), []);
+});
+
+test('R2 (S5f): a boost start on a unit read stopped (mode 3) is refused; the stop still goes', async (t) => {
+  const unit = fakeCcm();
+  unit.registers['1412'] = [3];
+  const ctx = await setup(t, { unit, config: ALLOW });
+  const ack = await ctx.press('boost-start');
+  assert.equal(ack.success, false);
+  assert.match(String(ack.error), /arrêtée/);
+  assert.deepEqual(ctx.unit.writes(), []);
+  ctx.unit.registers['1530'] = [1];
+  assert.equal((await ctx.press('boost-stop')).success, true);
+  assert.deepEqual(ctx.unit.writes(), [{ op: 'write', reg: '1530', value: 0 }]);
+});
+
+test('R2: a boost start on a running unit still reads the mode first, then writes', async (t) => {
+  const ctx = await setup(t, { config: ALLOW });
+  const before = ctx.unit.log.length;
+  assert.equal((await ctx.press('boost-start')).success, true);
+  const regs = ctx.unit.log.slice(before).map((r) => r.reg);
+  assert.deepEqual(regs.slice(0, 3), ['1412', '1530', '1530']);
+});
+
+test('S5g: a state register that never answers is read last: the measures still come', async (t) => {
+  const ctx = await setup(t);
+  ctx.unit.silent.add('1522'); // away
+  ctx.unit.registers['1472'] = [0x03, 0x84]; // outdoor 9 °C
+  for (let i = 0; i < 3; i += 1) await ctx.advance(MINUTE, 200);
+  assert.equal(ctx.state('temperature-outdoor').state, 9);
+  assert.equal(ctx.state('battery').state, 80);
+});
