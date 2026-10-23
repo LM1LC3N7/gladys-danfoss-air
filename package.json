@@ -1,6 +1,6 @@
 {
   "name": "gladys-danfoss-air",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": true,
   "description": "Gladys Assistant external integration for Danfoss Air heat recovery ventilation (CCM module): temperatures, humidity, fan, filter, bypass and boost over the local network; optional mode, fan step, boost and bypass commands. Unofficial, not affiliated with Danfoss.",
   "type": "module",
