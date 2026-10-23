@@ -878,8 +878,10 @@ export class DanfossAirApp {
   async commandSession(session, plan, { check, sendBy, answerBy, state }) {
     const { command } = plan;
     // The state just before acting, read now in this session, never the one in memory.
-    const needed =
-      command.needsManual || command.needsRunning ? ['mode', command.read] : [command.read];
+    // A command that may start the fans reads the mode and the step too (a stopped unit refuses it).
+    const needed = command.needsRunning
+      ? [...new Set(['mode', 'fanStep', command.read])]
+      : [command.read];
     const fresh = {};
     for (const key of needed) {
       const budget = Math.min(TIMINGS.commandReadMax, sendBy - TIMINGS.commandMinSend - this.now());
@@ -908,8 +910,11 @@ export class DanfossAirApp {
     // A fresh read of a command never reaffirms a boost stop.
     this.noteValues(fresh, { fromCommand: true });
     // A stopped unit (mode 3, or step 0 read) is never restarted by Gladys.
-    if (fresh.mode === 'off' || fresh.fanStep === 0) {
-      throw this.refusal(ERRORS.unitOff);
+    if (fresh.mode === 'off') {
+      throw this.refusal(ERRORS.unitOffMode);
+    }
+    if (fresh.fanStep === 0) {
+      throw this.refusal(ERRORS.unitOffStep);
     }
     if (command.needsManual && fresh.mode !== 'manual') {
       throw this.refusal(ERRORS.notManual);

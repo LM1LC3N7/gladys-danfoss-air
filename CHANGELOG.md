@@ -10,6 +10,14 @@ the notes of the version's GitHub Release.
 
 ## [Unreleased]
 
+### Fixed
+
+- A unit in manual mode with its fan step read at 0 is stopped: the mode
+  and "Start the boost" now read the step first and are refused, like the
+  fan step, so Gladys never restarts it (nothing is written).
+- The refusal on a stopped unit names its cause: mode 3 set from the Air
+  Dial, or the fan step read at 0.
+
 ## [0.1.1] - 2026-10-22
 
 ### Added

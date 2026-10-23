@@ -104,14 +104,17 @@ export const COMMANDS = {
     register: [0x14, 0x12],
     read: 'mode',
     values: { demand: 0, program: 1, manual: 2 },
+    needsRunning: true,
   },
   [FEATURES.FAN_STEP]: {
     register: [0x15, 0x61],
     read: 'fanStep',
     values: Object.fromEntries(FAN_STEPS.map((s) => [s, Number(s)])),
     needsManual: true,
+    needsRunning: true,
   },
-  // A boost may start the fans again: the mode is read first, refused on a stopped unit.
+  // `needsRunning`: these may start the fans again, so the mode and the step
+  // are read first, and a stopped unit (mode 3 or step 0) refuses them.
   [FEATURES.BOOST_START]: {
     register: [0x15, 0x30],
     read: 'boost',

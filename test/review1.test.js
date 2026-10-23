@@ -326,7 +326,7 @@ test('R2: a boost start on a running unit still reads the mode first, then write
   const before = ctx.unit.log.length;
   assert.equal((await ctx.press('boost-start')).success, true);
   const regs = ctx.unit.log.slice(before).map((r) => r.reg);
-  assert.deepEqual(regs.slice(0, 3), ['1412', '1530', '1530']);
+  assert.deepEqual(regs.slice(0, 4), ['1412', '1561', '1530', '1530']);
 });
 
 test('S5g: a state register that never answers is read last: the measures still come', async (t) => {
@@ -336,4 +336,40 @@ test('S5g: a state register that never answers is read last: the measures still 
   for (let i = 0; i < 3; i += 1) await ctx.advance(MINUTE, 200);
   assert.equal(ctx.state('temperature-outdoor').state, 9);
   assert.equal(ctx.state('battery').state, 80);
+});
+
+// --- Approval 2 --------------------------------------------------------------------
+
+test('N1 (S6b): manual mode with the step read 0: the mode and the boost start are refused too', async (t) => {
+  const unit = fakeCcm();
+  unit.registers['1412'] = [2];
+  unit.registers['1561'] = [0];
+  const ctx = await setup(t, { unit, config: ALLOW });
+  for (const [role, value] of [
+    ['mode', 'demand'],
+    ['boost-start', 1],
+    ['fan-step', '5'],
+  ]) {
+    const ack = await ctx.press(role, value);
+    assert.equal(ack.success, false, role);
+    assert.match(String(ack.error), /palier lu à 0/, role);
+  }
+  assert.deepEqual(ctx.unit.writes(), []);
+  // The bypass (a damper) and the boost stop still go.
+  assert.equal((await ctx.press('bypass-on')).success, true);
+});
+
+test('N2: the refusal names its cause: mode 3 from the Air Dial, or the step at 0', async (t) => {
+  const unit = fakeCcm();
+  unit.registers['1412'] = [3];
+  unit.registers['1561'] = [0];
+  const ctx = await setup(t, { unit, config: ALLOW });
+  const ack = await ctx.press('mode', 'demand');
+  assert.match(String(ack.error), /mode 3, depuis l’Air Dial/);
+  assert.doesNotMatch(String(ack.error), /palier/);
+  ctx.unit.registers['1412'] = [0];
+  const step = await ctx.press('boost-start');
+  assert.match(String(step.error), /palier lu à 0/);
+  assert.doesNotMatch(String(step.error), /mode 3/);
+  assert.deepEqual(ctx.unit.writes(), []);
 });

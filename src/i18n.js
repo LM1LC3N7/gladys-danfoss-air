@@ -135,9 +135,13 @@ export const ERRORS = {
     'No address for the CCM in the configuration: not sent.',
     'Aucune adresse du CCM dans la configuration : non envoyée.',
   ),
-  unitOff: both(
+  unitOffMode: both(
     'The unit is stopped (mode 3, from the Air Dial): Gladys neither stops nor restarts it. Command not sent.',
     'La centrale est arrêtée (mode 3, depuis l’Air Dial) : Gladys ne l’arrête ni ne la relance. Commande non envoyée.',
+  ),
+  unitOffStep: both(
+    'The unit is stopped (fan step read 0): Gladys neither stops nor restarts it. Command not sent.',
+    'La centrale est arrêtée (palier lu à 0) : Gladys ne l’arrête ni ne la relance. Commande non envoyée.',
   ),
   unknownMode: (byte) =>
     both(
