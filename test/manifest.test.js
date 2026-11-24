@@ -8,7 +8,10 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { DEFAULT_CONFIG } from '../src/config.js';
+import { createFakeGladys } from '@gladysassistant/integration-sdk/testing';
 import { ACTIONS, POLL_INTERVAL } from '../src/constants.js';
+import { buildDevice, ROLES } from '../src/devices.js';
+import { assertCoreDevice } from './helpers/coreFeature.js';
 
 const read = (path) => readFileSync(new URL(`../${path}`, import.meta.url), 'utf8');
 const manifest = JSON.parse(read('gladys-assistant-integration.json'));
@@ -109,5 +112,12 @@ test('the actions are the ones the code handles', () => {
   assert.deepEqual(manifest.actions.map((a) => a.key).sort(), Object.values(ACTIONS).sort());
   for (const name of Object.keys(ACTIONS)) {
     assert.ok(handlers.includes(`onAction(ACTIONS.${name}`), `ACTIONS.${name} has no handler`);
+  }
+});
+
+test('every feature has a numeric min and max and the other core fields', () => {
+  const gladys = createFakeGladys({ selector: 'danfoss-air' });
+  for (const language of ['en', 'fr']) {
+    assert.equal(assertCoreDevice(buildDevice(gladys, { language }), language), ROLES.length);
   }
 });

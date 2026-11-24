@@ -8,7 +8,7 @@ already taken and the next milestones.
 
 A Gladys Assistant **external integration** of type `device`: a Node.js
 service (Node 22+, ESM, no build step) in its own sandboxed Docker container,
-talking to Gladys through `@gladysassistant/integration-sdk` (v0.15), its only
+talking to Gladys through `@gladysassistant/integration-sdk` (v0.16), its only
 runtime dependency (TCP goes through `node:net`). It reads a Danfoss Air
 ventilation unit through its CCM module (TCP 30046, no cloud, no
 authentication) and shows it as one Gladys device; commands behind an
@@ -19,7 +19,7 @@ real device, not affiliated with Danfoss.
 
 ```bash
 npm install
-npm test                                  # node --test, the built-in runner
+npm test                                  # node --test --test-timeout=60000
 node --test test/app.test.js              # one file
 npm run lint                              # ESLint
 npm run format:check                      # Prettier, as the CI runs it
@@ -53,6 +53,12 @@ scripts/cover.mjs         cover.png generator
 
 ## Rules
 
+- **Features follow the core model.** Every feature has a numeric `min` and
+  `max` (0/0 for text), a non-empty name, `read_only` and `has_feedback`:
+  Gladys answers HTTP 422 otherwise. The SDK's fake Gladys (0.16.1) checks
+  part of it; `test/helpers/coreFeature.js` checks all (test/manifest.test.js).
+  Devices carry `should_poll: false` (Gladys 5.3 polls a device with
+  `poll_frequency` unless it says so).
 - **External ids are forever**: device `danfoss-air:ccm` (no serial in the
   protocol: frozen rule), feature roles in `FEATURES` of `src/constants.js`.
   Every role is always built: a republished device never loses a feature.
