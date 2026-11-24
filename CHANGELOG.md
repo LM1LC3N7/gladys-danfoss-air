@@ -10,6 +10,8 @@ the notes of the version's GitHub Release.
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-11-24
+
 ### Changed
 
 - Integration SDK 0.16.1 (no change for the devices).
@@ -57,6 +59,7 @@ the notes of the version's GitHub Release.
 - "Test the connection" button; documentation in English and French;
   `LICENSE` and `THIRD_PARTY_NOTICES.md` shipped in the image.
 
-[Unreleased]: https://github.com/LM1LC3N7/gladys-danfoss-air/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/LM1LC3N7/gladys-danfoss-air/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/LM1LC3N7/gladys-danfoss-air/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/LM1LC3N7/gladys-danfoss-air/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/LM1LC3N7/gladys-danfoss-air/releases/tag/v0.1.1
