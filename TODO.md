@@ -143,3 +143,7 @@ up to date at the end of every milestone.
   often; the CCM is shared with the Danfoss app).
 - **Not done**: Bluetooth (none), scenes, widgets, away mode command (not in
   pydanfossair).
+
+## Next patch
+
+- Migration review minors: see `_lots/migration-reviews/w10-gladys-danfoss-air-r1.md`.
